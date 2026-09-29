@@ -13,32 +13,53 @@ import { sanitizeErrorMessage } from './errorSanitizer.js'
 const MAX_BACKOFF_SECONDS = 3600
 
 /**
- * Maximum number of events a single claim call may request.
- * Guards against unbounded result sets / memory pressure when callers pass
- * an oversized or attacker-influenced limit.
+ * Hard upper bound on rows returned by any single query in this repository.
+ * Prevents accidental unbounded scans from callers passing Infinity/NaN/negative
+ * limits, which would otherwise be forwarded verbatim to the database.
  */
-const MAX_CLAIM_LIMIT = 1000
+const MAX_QUERY_LIMIT = 10_000
 
 /**
- * Maximum lease duration (seconds) accepted by claim/renew operations.
- * Prevents a caller from pinning events indefinitely and starving other
- * consumers of work.
+ * Normalize a caller-supplied row limit into a safe integer in [1, MAX_QUERY_LIMIT].
+ * Boundary behavior:
+ *  - undefined / null / NaN / Infinity / negative / 0  -> fallback (default 100)
+ *  - fractional values are floored
+ *  - values above MAX_QUERY_LIMIT are clamped
  */
-const MAX_LEASE_SECONDS = 86_400
+function normalizeLimit(value: number | undefined | null, fallback: number = 100): number {
+  if (value === undefined || value === null) return fallback
+  if (typeof value !== 'number' || !Number.isFinite(value)) return fallback
+  const floored = Math.floor(value)
+  if (floored <= 0) return fallback
+  return Math.min(floored, MAX_QUERY_LIMIT)
+}
 
 /**
- * Clamp a numeric input into [min, max], falling back to `fallback` when the
- * value is not a finite number. Keeps boundary behavior deterministic for
- * NaN, Infinity, negative, and zero inputs.
+ * Normalize a lease duration in seconds into a safe positive integer.
+ * Boundary behavior:
+ *  - undefined / null / NaN / Infinity / <= 0 -> fallback (default 300)
+ *  - fractional values are floored
+ *  - values above MAX_BACKOFF_SECONDS are clamped to avoid pathological leases
  */
-function clampInt(value: number, min: number, max: number, fallback: number): number {
-  if (typeof value !== 'number' || !Number.isFinite(value)) {
-    return fallback
-  }
-  const truncated = Math.trunc(value)
-  if (truncated < min) return min
-  if (truncated > max) return max
-  return truncated
+function normalizeLeaseSeconds(value: number | undefined | null, fallback: number = 300): number {
+  if (value === undefined || value === null) return fallback
+  if (typeof value !== 'number' || !Number.isFinite(value)) return fallback
+  const floored = Math.floor(value)
+  if (floored <= 0) return fallback
+  return Math.min(floored, MAX_BACKOFF_SECONDS)
+}
+
+/**
+ * Normalize a pagination offset into a non-negative integer.
+ * Boundary behavior:
+ *  - undefined / null / NaN / Infinity / negative -> 0
+ *  - fractional values are floored
+ */
+function normalizeOffset(value: number | undefined | null): number {
+  if (value === undefined || value === null) return 0
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 0
+  const floored = Math.floor(value)
+  return floored < 0 ? 0 : floored
 }
 
 type OutboxEventRow = {

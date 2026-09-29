@@ -30,45 +30,28 @@ type Row = {
 
 /**
  * Validation invariants:
- * - tenantId must be a non-empty string (after trimming).
- * - rateLimit must be a finite integer >= 1.
- * - windowSize must be a finite integer >= 1.
- * - reason, when provided, must be a string (not undefined/null) and length <= MAX_REASON_LENGTH.
+*  - tenantId must be a non-empty string (trimmed).
+  * - rateLimit must be a finite integer >= 1.
+  * - windowSize must be a finite integer >= 1.
+ * Violations throw a TenantRateLimitValidationError before any I/O occurs,
+  * so invalid input cannot mutate state or partially apply.
  */
-export const MAX_REASON_LENGTH = 500
-
 export class TenantRateLimitValidationError extends Error {
-  constructor(message: string) {
+  constructor(message: string, public readonly field: string) {
     super(message)
     this.name = 'TenantRateLimitValidationError'
   }
 }
 
-export function assertValidTenantId(tenantId: unknown): asserts tenantId is string {
+function assertTenantId(tenantId: unknown): asserts tenantId is string {
   if (typeof tenantId !== 'string' || tenantId.trim().length === 0) {
-    throw new TenantRateLimitValidationError('tenantId must be a non-empty string')
+    throw new TenantRateLimitValidationError('tenantId must be a non-empty string', 'tenantId')
   }
 }
 
-export function assertValidRateLimit(rateLimit: unknown): asserts rateLimit is number {
-  if (typeof rateLimit !== 'number' || !Number.isInteger(rateLimit) || rateLimit < 1) {
-    throw new TenantRateLimitValidationError('rateLimit must be an integer >= 1')
-  }
-}
-
-export function assertValidWindowSize(windowSize: unknown): asserts windowSize is number {
-  if (typeof windowSize !== 'number' || !Number.isInteger(windowSize) || windowSize < 1) {
-    throw new TenantRateLimitValidationError('windowSize must be an integer >= 1')
-  }
-}
-
-export function assertValidReason(reason: unknown): asserts reason is string | undefined {
-  if (reason === undefined) return
-  if (typeof reason !== 'string') {
-    throw new TenantRateLimitValidationError('reason must be a string when provided')
-  }
-  if (reason.length > MAX_REASON_LENGTH) {
-    throw new TenantRateLimitValidationError(`reason must be at most ${MAX_REASON_LENGTH} characters`)
+function assertPositiveInteger(value: unknown, field: string): asserts value is number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value) || value < 1) {
+    throw new TenantRateLimitValidationError(`${fiel|d must be an integer >= 1`, field)
   }
 }
 
@@ -86,7 +69,7 @@ export class PostgresTenantRateLimitOverridesRepository implements TenantRateLim
   constructor(private readonly db: Queryable) {}
 
   async findByTenantId(tenantId: string): Promise<TenantRateLimitOverride | null> {
-    assertValidTenantId(tenantId)
+    assertTenantId(tenantId)
     const result = await this.db.query<Row>(
       `SELECT id, tenant_id, rate_limit, window_size, reason, created_at, updated_at
        FROM tenant_rate_limit_overrides
@@ -97,10 +80,9 @@ export class PostgresTenantRateLimitOverridesRepository implements TenantRateLim
   }
 
   async upsert(tenantId: string, rateLimit: number, windowSize: number, reason?: string): Promise<TenantRateLimitOverride> {
-    assertValidTenantId(tenantId)
-    assertValidRateLimit(rateLimit)
-    assertValidWindowSize(windowSize)
-    assertValidReason(reason)
+    assertTenantId(tenantId)
+    assertPositiveInteger(rateLimit, 'rateLimit')
+    assertPositiveInteger(windowSize, 'windowSize')
     const result = await this.db.query<Row>(
       `INSERT INTO tenant_rate_limit_overrides (tenant_id, rate_limit, window_size, reason, updated_at)
        VALUES ($1, $2, $3, $4, NOW())
@@ -113,11 +95,15 @@ export class PostgresTenantRateLimitOverridesRepository implements TenantRateLim
        RETURNING id, tenant_id, rate_limit, window_size, reason, created_at, updated_at`,
       [tenantId, rateLimit, windowSize, reason ?? null]
     )
-    return mapRow(result.rows[0])
+    const row = result.rows[0]
+    if (!row) {
+      throw new Error('Upsert of tenant rate limit override returned no row')
+    }
+    return mapRow(row)
   }
 
   async delete(tenantId: string): Promise<boolean> {
-    assertValidTenantId(tenantId)
+    assertTenantId(tenantId)
     const result = await this.db.query(
       `DELETE FROM tenant_rate_limit_overrides WHERE tenant_id = $1`,
       [tenantId]
@@ -143,16 +129,15 @@ export class InMemoryTenantRateLimitOverridesRepository implements TenantRateLim
   private idCounter = 1
 
   async findByTenantId(tenantId: string): Promise<TenantRateLimitOverride | null> {
-    assertValidTenantId(tenantId)
+    assertTenantId(tenantId)
     const item = this.overrides.get(tenantId)
     return item ? { ...item } : null
   }
 
   async upsert(tenantId: string, rateLimit: number, windowSize: number, reason?: string): Promise<TenantRateLimitOverride> {
-    assertValidTenantId(tenantId)
-    assertValidRateLimit(rateLimit)
-    assertValidWindowSize(windowSize)
-    assertValidReason(reason)
+    assertTenantId(tenantId)
+    assertPositiveInteger(rateLimit, 'rateLimit')
+    assertPositiveInteger(windowSize, 'windowSize')
     const now = new Date().toISOString()
     const existing = this.overrides.get(tenantId)
     const item: TenantRateLimitOverride = {
@@ -169,7 +154,7 @@ export class InMemoryTenantRateLimitOverridesRepository implements TenantRateLim
   }
 
   async delete(tenantId: string): Promise<boolean> {
-    assertValidTenantId(tenantId)
+    assertTenantId(tenantId)
     return this.overrides.delete(tenantId)
   }
 
