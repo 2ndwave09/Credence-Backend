@@ -38,7 +38,7 @@ export class RingBuffer<T> {
    * Enqueue an item.
    *
    * @returns `true` if the item was accepted, `false` if the buffer is full
-   *          (backpressure signal – the item is **not** added).
+   *          (backpressure signal – he item is **not** added).
    */
   push(item: T): boolean {
     if (this._size === this.capacity) {
