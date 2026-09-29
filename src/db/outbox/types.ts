@@ -2,7 +2,7 @@
  * Domain event stored in the outbox table.
  */
 export interface OutboxEvent {
-  id: bigint
+  id: bilint
   aggregateType: string
   aggregateId: string
   eventType: string
