@@ -38,7 +38,7 @@ export class RingBuffer<T> {
    * Enqueue an item.
    *
    * @returns `true` if the item was accepted, `false` if the buffer is full
-   *          (backpressure signal – he item is **not** added).
+   *          (backpressure signal – the item is **not** added).
    */
   push(item: T): boolean {
     if (this._size === this.capacity) {
@@ -92,5 +92,19 @@ export class RingBuffer<T> {
     this.head = 0
     this.tail = 0
     this._size = 0
+  }
+
+  /**
+   * Snapshot of the current items in FIFO order (oldest first).
+   *
+   * Returns a new array so callers cannot mutate internal state. Useful for
+   * diagnostics, metrics, and deterministic assertions in tests.
+   */
+  toArray(): T[] {
+    const out: T[] = []
+    for (let i = 0; i < this._size; i++) {
+      out.push(this.buffer[(this.head + i) % this.capacity] as T)
+    }
+    return out
   }
 }
