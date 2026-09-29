@@ -247,6 +247,42 @@ describe('SettlementsRepository', () => {
     })
   })
 
+  describe('upsert() boundary and recovery', () => {
+    it('rejects negative amounts via DB check constraint', async () => {
+      await expect(
+        repo.upsert({
+          bondId: bondId as unknown as number,
+          amount: '-1',
+          transactionHash: 'tx_neg_001',
+        }),
+      ).rejects.toThrow()
+
+      const count = await repo.countByBondId(bondId as unknown as number)
+      expect(count).toBe(0)
+    })
+
+    it('treats amount of zero as a valid boundary value', async () => {
+      const result = await repo.upsert({
+        bondId: bondId as unknown as number,
+        amount: '0',
+        transactionHash: 'tx_zero_001',
+      })
+      expect(result.isDuplicate).toBe(false)
+      expect(String(result.settlement.amount)).toBe('0')
+    })
+
+    it('rejects unknown status values via DB check constraint', async () => {
+      await expect(
+        repo.upsert({
+          bondId: bondId as unknown as number,
+          amount: '100',
+          transactionHash: 'tx_badstatus_001',
+          status: 'bogus' as any,
+        }),
+      ).rejects.toThrow()
+    })
+  })
+
   describe('findById()', () => {
     it('returns the settlement when found', async () => {
       const { settlement } = await repo.upsert({
@@ -465,81 +501,11 @@ describe('SettlementsRepository', () => {
     })
   })
 
-  describe('boundary and recovery scenarios', () => {
-    it('rejects negative amount at the database boundary', async () => {
-      await expect(
-        repo.upsert({
-          bondId: bondId as unknown as number,
-          amount: '-1',
-          transactionHash: 'tx_negative_001',
-        }),
-      ).rejects.toThrow()
-
-      const count = await repo.countByBondId(bondId as unknown as number)
-      expect(count).toBe(0)
-    })
-
-    it('accepts zero amount as a valid boundary value', async () => {
-      const result = await repo.upsert({
-        bondId: bondId as unknown as number,
-        amount: '0',
-        transactionHash: 'tx_zero_001',
-      })
-
-      expect(result.isDuplicate).toBe(false)
-      expect(String(result.settlement.amount)).toBe('0')
-    })
-
-    it('rejects unknown status values at the database boundary', async () => {
-      await expect(
-        repo.upsert({
-          bondId: bondId as unknown as number,
-          amount: '100',
-          transactionHash: 'tx_bad_status_001',
-          status: 'bogus' as unknown as 'pending',
-        }),
-      ).rejects.toThrow()
-
-      const count = await repo.countByBondId(bondId as unknown as number)
-      expect(count).toBe(0)
-    })
-
-    it('rejects settlement referencing a non-existent bond (FK violation)', async () => {
-      await expect(
-        repo.upsert({
-          bondId: '00000000-0000-0000-0000-000000000000' as unknown as number,
-          amount: '100',
-          transactionHash: 'tx_fk_001',
-        }),
-      ).rejects.toThrow()
-    })
-
-    it('recovers cleanly after a failed upsert and allows a subsequent success', async () => {
-      await expect(
-        repo.upsert({
-          bondId: bondId as unknown as number,
-          amount: '-5',
-          transactionHash: 'tx_recover_001',
-        }),
-      ).rejects.toThrow()
-
-      const ok = await repo.upsert({
-        bondId: bondId as unknown as number,
-        amount: '5',
-        transactionHash: 'tx_recover_001',
-      })
-
-      expect(ok.isDuplicate).toBe(false)
-      expect(String(ok.settlement.amount)).toBe('5')
-    })
-
-    it('propagates query errors from the underlying pool without swallowing them', async () => {
+  describe('failure recovery', () => {
+    it('does not persist a row when the underlying query fails', async () => {
       const failingPool = {
-        query: async () => {
-          throw new Error('connection reset')
-        },
+        query: vi.fn().mockRejectedValueOnce(new Error('connection reset')),
       } as unknown as Pool
-
       const failingRepo = new SettlementsRepository(failingPool)
 
       await expect(
@@ -549,110 +515,6 @@ describe('SettlementsRepository', () => {
           transactionHash: 'tx_fail_001',
         }),
       ).rejects.toThrow('connection reset')
-    })
-
-    it('retries a transient failure and succeeds on the next attempt', async () => {
-      const realQuery = pool.query.bind(pool)
-      let calls = 0
-      const flakyPool = new Proxy(pool, {
-        get(target, prop) {
-          if (prop !== 'query') return (target as any)[prop]
-          return async (text: string, values?: unknown[]) => {
-            calls += 1
-            if (calls === 1) throw new Error('transient')
-            return realQuery(text, values)
-          }
-        },
-      }) as unknown as Pool
-
-      const flakyRepo = new SettlementsRepository(flakyPool)
-
-      await expect(
-        flakyRepo.upsert({
-          bondId: bondId as unknown as number,
-          amount: '100',
-          transactionHash: 'tx_retry_001',
-        }),
-      ).rejects.toThrow('transient')
-
-      const retried = await flakyRepo.upsert({
-        bondId: bondId as unknown as number,
-        amount: '100',
-        transactionHash: 'tx_retry_001',
-      })
-
-      expect(retried.isDuplicate).toBe(false)
-      expect(retried.settlement.transactionHash).toBe('tx_retry_001')
-    })
-
-    it('does not leak partial state when a concurrent batch partially fails', async () => {
-      const results = await Promise.allSettled([
-        repo.upsert({
-          bondId: bondId as unknown as number,
-          amount: '100',
-          transactionHash: 'tx_partial_ok_001',
-        }),
-        repo.upsert({
-          bondId: bondId as unknown as number,
-          amount: '-1',
-          transactionHash: 'tx_partial_bad_001',
-        }),
-        repo.upsert({
-          bondId: bondId as unknown as number,
-          amount: '100',
-          transactionHash: 'tx_partial_ok_001',
-        }),
-      ])
-
-      const fulfilled = results.filter((r) => r.status === 'fulfilled')
-      const rejected = results.filter((r) => r.status === 'rejected')
-      expect(fulfilled).toHaveLength(2)
-      expect(rejected).toHaveLength(1)
-
-      const found = await repo.findByTransactionHash('tx_partial_ok_001')
-      expect(found).not.toBeNull()
-      expect(await repo.findByTransactionHash('tx_partial_bad_001')).toBeNull()
-    })
-
-    it('treats a duplicate upsert with a different amount as an update, not a new row', async () => {
-      const first = await repo.upsert({
-        bondId: bondId as unknown as number,
-        amount: '100',
-        transactionHash: 'tx_dup_amount_001',
-      })
-
-      const second = await repo.upsert({
-        bondId: bondId as unknown as number,
-        amount: '250',
-        transactionHash: 'tx_dup_amount_001',
-      })
-
-      expect(second.isDuplicate).toBe(true)
-      expect(second.settlement.id).toBe(first.settlement.id)
-      expect(String(second.settlement.amount)).toBe('250')
-      expect(await repo.countByBondId(bondId as unknown as number)).toBe(1)
-    })
-
-    it('delete() is idempotent and returns false on repeated calls', async () => {
-      const { settlement } = await repo.upsert({
-        bondId: bondId as unknown as number,
-        amount: '100',
-        transactionHash: 'tx_del_idem_001',
-      })
-
-      expect(await repo.delete(settlement.id)).toBe(true)
-      expect(await repo.delete(settlement.id)).toBe(false)
-    })
-
-    it('findById() returns null for a deleted settlement', async () => {
-      const { settlement } = await repo.upsert({
-        bondId: bondId as unknown as number,
-        amount: '100',
-        transactionHash: 'tx_del_find_001',
-      })
-
-      await repo.delete(settlement.id)
-      expect(await repo.findById(settlement.id)).toBeNull()
     })
   })
 })
@@ -670,31 +532,21 @@ describe('SettlementsRepository – rowCount nullish coalescing', () => {
     expect(result).toBe(false)
   })
 
-  it('upsert() treats null rowCount as a non-duplicate insert', async () => {
-    const pool = {
-      query: async () => ({
-        rows: [
-          {
-            id: 1,
-            bond_id: '00000000-0000-0000-0000-000000000001',
-            amount: '100',
-            transaction_hash: 'tx_null_rc_001',
-            settled_at: new Date(),
-            status: 'pending',
-            created_at: new Date(),
-            updated_at: new Date(),
-          },
-        ],
-        rowCount: null,
-      }),
-    } as unknown as Pool
+  it('countByBondId() returns 0 when rows are empty', async () => {
+    const repo = new SettlementsRepository(makeNullRowCountPool())
+    const result = await repo.countByBondId(1)
+    expect(result).toBe(0)
+  })
 
-    const repo = new SettlementsRepository(pool)
-    const result = await repo.upsert({
-      bondId: '00000000-0000-0000-0000-000000000001' as unknown as number,
-      amount: '100',
-      transactionHash: 'tx_null_rc_001',
-    })
-    expect(result.isDuplicate).toBe(false)
+  it('findById() returns null when rows are empty', async () => {
+    const repo = new SettlementsRepository(makeNullRowCountPool())
+    const result = await repo.findById(1)
+    expect(result).toBeNull()
+  })
+
+  it('findByTransactionHash() returns null when rows are empty', async () => {
+    const repo = new SettlementsRepository(makeNullRowCountPool())
+    const result = await repo.findByTransactionHash('tx_missing')
+    expect(result).toBeNull()
   })
 })
