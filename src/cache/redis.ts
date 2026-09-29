@@ -272,12 +272,16 @@ export class CacheService {
   }
 
   /**
-   * Clear all keys in a namespace
-   * 
+   * Clear all keys in a namespace.
+   *
    * @param namespace - Cache namespace to clear
+   * @param options - Whether backend errors should be propagated
    * @returns Number of keys deleted
    */
-  public async clearNamespace(namespace: string): Promise<number> {
+  public async clearNamespace(
+    namespace: string,
+    options: { throwOnError?: boolean } = {}
+  ): Promise<number> {
     const pattern = this.getNamespacedKey(namespace, '*')
 
     // Clear from L1
@@ -295,6 +299,9 @@ export class CacheService {
       return result
     } catch (error) {
       logger.error(`Cache clear namespace failed for ${namespace}:`, error)
+      if (options.throwOnError) {
+        throw error
+      }
       return 0
     }
   }
