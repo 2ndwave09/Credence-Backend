@@ -33,6 +33,7 @@ type OutboxEventRow = {
   shard_id?: number | null
   correlation_id?: string | null
   publish_idempotency_key?: string | null
+  next_attempt_at?: string | null
 }
 
 type OutboxQuarantineRow = {
@@ -118,6 +119,7 @@ function mapOutboxEvent(row: OutboxEventRow): OutboxEvent {
     shardId: row.shard_id,
     correlationId: row.correlation_id,
     publishIdempotencyKey: row.publish_idempotency_key,
+    nextAttemptAt: row.next_attempt_at ? new Date(row.next_attempt_at) : null,
   }
 }
 
@@ -165,6 +167,9 @@ export class OutboxRepository {
         event.correlationId,
       ]
     )
+    if (result.rows.length === 0) {
+      throw new Error('Outbox event insert did not return an id')
+    }
     return BigInt(result.rows[0].id)
   }
 
@@ -210,6 +215,7 @@ export class OutboxRepository {
         shard_id: number | null
         correlation_id: string | null
         publish_idempotency_key: string | null
+        next_attempt_at: string | null
       }>(
         `UPDATE event_outbox
          SET status = 'processing',
@@ -257,6 +263,7 @@ export class OutboxRepository {
         shard_id: number | null
         correlation_id: string | null
         publish_idempotency_key: string | null
+        next_attempt_at: string | null
       }>(
         `UPDATE event_outbox
          SET status = 'processing',
@@ -348,6 +355,7 @@ export class OutboxRepository {
       span_id: string | null
       tracestate: string | null
       correlation_id: string | null
+      next_attempt_at: string | null
     }>(
       `SELECT id, aggregate_type, aggregate_id, event_type, payload, status,
               retry_count, max_retries, created_at, processed_at, error_message,
@@ -385,6 +393,7 @@ export class OutboxRepository {
         span_id: string | null
         tracestate: string | null
         correlation_id: string | null
+        next_attempt_at: string | null
       }>(
         `UPDATE event_outbox
          SET status = 'processing'
@@ -420,6 +429,7 @@ export class OutboxRepository {
         span_id: string | null
         tracestate: string | null
         correlation_id: string | null
+        next_attempt_at: string | null
       }>(
         `UPDATE event_outbox
          SET status = 'processing'
@@ -446,6 +456,9 @@ export class OutboxRepository {
        WHERE status IN ('pending', 'processing')`
     )
 
+    if (result.rows.length === 0) {
+      return 0
+    }
     const lagSeconds = result.rows[0]?.lag_seconds
     return lagSeconds !== null && lagSeconds !== undefined
       ? Number(lagSeconds)
@@ -483,6 +496,9 @@ export class OutboxRepository {
        RETURNING id`,
       [eventId.toString(), key, consumerId]
     )
+    if (result.rows.length === 0) {
+      return false
+    }
     return (result.rowCount ?? 0) > 0
   }
 
@@ -529,6 +545,9 @@ export class OutboxRepository {
       [eventId.toString(), sanitizedMessage, consumerId, MAX_BACKOFF_SECONDS]
     )
 
+    if (upd.rows.length === 0) {
+      requireTransition(0, eventId, 'markFailed')
+    }
     const row = upd.rows[0]
     requireTransition(upd.rowCount ?? 0, eventId, 'markFailed')
     const retryCount = Number(row.retry_count)
@@ -566,6 +585,7 @@ export class OutboxRepository {
       span_id: string | null
       tracestate: string | null
       correlation_id: string | null
+      next_attempt_at: string | null
     }>(
       `SELECT id, aggregate_type, aggregate_id, event_type, payload, status,
               retry_count, max_retries, created_at, processed_at, error_message,
@@ -660,6 +680,9 @@ export class OutboxRepository {
         )
       }
     }
+    if (deleteResult.rows.length === 0) {
+      throw new Error(`Outbox event ${event.id} not found for quarantine`)
+    }
   }
 
   async listQuarantine(
@@ -692,6 +715,9 @@ export class OutboxRepository {
       params
     )
 
+    if (result.rows.length === 0) {
+      return { entries: [], total: 0 }
+    }
     return {
       entries: result.rows.map(mapQuarantineEntry),
       total: Number(result.rows[0]?.total_count ?? 0),
@@ -734,6 +760,9 @@ export class OutboxRepository {
       [quarantineId.toString(), JSON.stringify(fixedPayload), reinjectedBy]
     )
 
+    if (result.rows.length === 0) {
+      return null
+    }
     const id = result.rows[0]?.id
     return id ? BigInt(id) : null
   }
@@ -752,6 +781,9 @@ export class OutboxRepository {
        SELECT COUNT(*) as deleted_count FROM deleted`,
       [config.publishedRetentionDays, config.failedRetentionDays]
     )
+    if (result.rows.length === 0) {
+      return 0
+    }
     return result.rows[0]?.deleted_count ?? 0
   }
 
@@ -780,6 +812,9 @@ export class OutboxRepository {
     }
     for (const row of result.rows) {
       stats[row.status] = parseInt(row.count, 10)
+    }
+    if (result.rows.length === 0) {
+      return stats
     }
     return stats
   }

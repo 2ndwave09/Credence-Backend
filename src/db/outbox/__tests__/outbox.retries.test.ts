@@ -1,4 +1,5 @@
 import crypto from 'crypto'
+import crypto from 'crypto'
 import { newDb } from 'pg-mem'
 import type { IMemoryDb } from 'pg-mem'
 import { Pool } from 'pg'
@@ -313,3 +314,4 @@ describe('Outbox lifecycle transition invariants', () => {
         expect(unchanged.rows[0]).toMatchObject({ status: 'processing', retry_count: 0 })
     })
 })
+

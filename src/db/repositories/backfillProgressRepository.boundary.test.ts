@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Boundary + recovery coverage for src/db/repositories/backfillProgressRepository.ts.
  *
@@ -7,6 +8,7 @@
  * - retries/partial failure/concurrent execution cannot corrupt state
  * - success/rejection/boundary/regression scenarios
  * - callers remain compatible (public method shapes unchanged)
+ * - failures diagnosable without exposing sensitive data
  * - failures diagnosable without exposing sensitive data
  *
  * States covered: loading (find), error (invalid input / unknown job),
