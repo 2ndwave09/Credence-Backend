@@ -50,19 +50,6 @@ const MAX_REPLICA_LAG_MS = cfg.db.maxReplicaLagMs;
 const TENANT_CONNECTION_BUDGET = Math.max(1, Math.min(envInt("DB_TENANT_CONNECTION_BUDGET", Math.max(1, Math.floor(POOL_MAX / 4))), POOL_MAX));
 const tenantConnectionCounts = new Map<string, number>();
 
-/**
- * Reset the per-tenant connection accounting map.
- *
- * Exported for tests only. Production code must never call this — doing so
- * while connections are checked out would let a tenant exceed its budget
- * until the next release. Tests use it to guarantee deterministic state
- * between cases (see src/db/pool.test.ts).
- * @internal Exported for testing only.
- */
-export function __resetTenantConnectionCountsForTests(): void {
-  tenantConnectionCounts.clear();
-}
-
 export class TenantConnectionBudgetError extends AppError {
   constructor(
     public readonly tenantId: string,
@@ -81,17 +68,8 @@ export class TenantConnectionBudgetError extends AppError {
 function wrapTenantBudgetedClient(client: PoolClient, tenantId: string): PoolClient {
   const release = client.release.bind(client);
   const key = tenantId;
-  // Guard against double-release: node-postgres throws if release() is called
-  // twice, but our accounting must not decrement twice either, otherwise a
-  // tenant could silently exceed its budget. Track per-wrapper release state.
-  let released = false;
 
   client.release = ((err?: Error | boolean) => {
-    if (released) {
-      // Preserve pg's own double-release error semantics by delegating once.
-      return release(err);
-    }
-    released = true;
     const active = tenantConnectionCounts.get(key) ?? 0;
     if (active <= 1) {
       tenantConnectionCounts.delete(key);
@@ -118,24 +96,8 @@ function withTenantConnectionBudget(pool: Pool): Pool {
       throw new TenantConnectionBudgetError(tenantId, TENANT_CONNECTION_BUDGET);
     }
 
-    // Reserve the slot *before* awaiting the underlying connect so that
-    // concurrent callers for the same tenant cannot both observe the same
-    // `activeConnections` value and race past the budget check. If the
-    // underlying connect fails, release the reservation so the tenant is
-    // not permanently penalized by a transient pool error.
+    const client = await originalConnect();
     tenantConnectionCounts.set(tenantId, activeConnections + 1);
-    let client: PoolClient;
-    try {
-      client = await originalConnect();
-    } catch (err) {
-      const current = tenantConnectionCounts.get(tenantId) ?? 0;
-      if (current <= 1) {
-        tenantConnectionCounts.delete(tenantId);
-      } else {
-        tenantConnectionCounts.set(tenantId, current - 1);
-      }
-      throw err;
-    }
     return wrapTenantBudgetedClient(client, tenantId);
   }) as typeof pool.connect;
 
@@ -542,16 +504,8 @@ export async function withReplica<T>(
     const { rows } = await replicaPool.query(
       `SELECT COALESCE(EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp())) * 1000, 0) as lag_ms`
     );
-    const rawLag = rows[0]?.lag_ms;
-    // Normalize the lag value: pg may return a string, null, NaN, or a
-    // negative value (clock skew between primary and replica). Treat any
-    // non-finite or negative reading as 0 so a bad sample cannot
-    // spuriously trigger fallback, and so the boundary comparison below
-    // is deterministic.
-    const parsedLag = typeof rawLag === "number" ? rawLag : Number(rawLag);
-    const lagMs = Number.isFinite(parsedLag) && parsedLag > 0 ? parsedLag : 0;
+    const lagMs = rows[0]?.lag_ms ?? 0;
 
-    // Boundary: lag exactly at the threshold is acceptable (inclusive).
     if (lagMs > maxLagMs) {
       if (!fallback) {
         throw new Error(`Replica lag too high: ${lagMs}ms`);
@@ -563,21 +517,38 @@ export async function withReplica<T>(
   } catch (err) {
     if (fallback) {
       logger.warn(`[withReplica] Replica error or lag exceeded, falling back to primary: ${err instanceof Error ? err.message : err}`);
-      try {
-        return await operation(pool);
-      } catch (primaryErr) {
-        // Preserve both failures so operators can diagnose whether the
-        // replica, the primary, or both are unhealthy. The original replica
-        // error is attached as `cause` for structured logging.
-        logger.error(
-          `[withReplica] Primary fallback also failed: ${primaryErr instanceof Error ? primaryErr.message : primaryErr}`
-        );
-        if (primaryErr instanceof Error) {
-          (primaryErr as Error & { cause?: unknown }).cause ??= err;
-        }
-        throw primaryErr;
-      }
+      return await operation(pool);
     }
     throw err;
   }
 }
+
+/**
+ * Test-only helpers for exercising pool boundary and recovery behavior.
+ * These are exported so focused tests can deterministically simulate
+ * tenant budget exhaustion, release accounting, and replica fallback
+ * without touching production call sites.
+ * @internal Exported for testing only.
+ */
+export const __poolTestHooks = {
+  getTenantConnectionCount(tenantId: string): number {
+    return tenantConnectionCounts.get(tenantId) ?? 0;
+  },
+  setTenantConnectionCount(tenantId: string, count: number): void {
+    if (count <= 0) {
+      tenantConnectionCounts.delete(tenantId);
+    } else {
+      tenantConnectionCounts.set(tenantId, count);
+    }
+  },
+  clearTenantConnectionCounts(): void {
+    tenantConnectionCounts.clear();
+  },
+  getTenantConnectionBudget(): number {
+    return TENANT_CONNECTION_BUDGET;
+  },
+  getMaxReplicaLagMs(): number {
+    return MAX_REPLICA_LAG_MS;
+  },
+  checkPoolSaturation,
+};
