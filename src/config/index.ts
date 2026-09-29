@@ -10,6 +10,27 @@ import {
 
 dotenv.config()
 
+/**
+ * Builds a numeric env field that rejects blank input.
+ *
+ * Invariant: an empty or whitespace-only value must be rejected, never coerced.
+ * `Number('')` and `Number('   ')` are both `0`, so for any field whose lower
+ * bound is `0` a blank value slips through and silently becomes `0` — which
+ * disables DB statement timeouts (`DB_STATEMENT_TIMEOUT_MS`), zeroes new orgs'
+ * credit balances (`DEFAULT_MONTHLY_CREDITS`), or wedges report generation
+ * (`REPORT_MAX_CONCURRENT_JOBS_PER_ORG`). Fields bounded above `0` already
+ * reject `0`; this closes the same hole for the `0`-bounded ones so blank input
+ * fails fast and diagnosably instead of degrading behaviour.
+ */
+const numeric = (defaultValue: string) =>
+  z
+    .string()
+    .default(defaultValue)
+    .refine((val) => val.trim() !== '', {
+      message: 'must be a number',
+    })
+    .transform(Number)
+
 export const envSchema = z.object({
     // Trust score cache TTL (seconds)
     TRUST_SCORE_CACHE_TTL: z
@@ -35,7 +56,12 @@ export const envSchema = z.object({
   LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
 
   // Database
-  DB_URL: z.string().url({ message: 'DB_URL must be a valid URL' }),
+  // The `message` on z.string() covers the absent case: without it a missing
+  // required var reports "expected string, received undefined", which gives an
+  // operator nothing actionable at boot time.
+  DB_URL: z
+    .string({ message: 'DB_URL is required' })
+    .url({ message: 'DB_URL must be a valid URL' }),
 
   // Database pool tuning
   DB_POOL_MAX: z
@@ -43,21 +69,13 @@ export const envSchema = z.object({
     .default('20')
     .transform(Number)
     .pipe(z.number().int().min(1).max(200)),
-  DB_POOL_IDLE_TIMEOUT_MS: z
-    .string()
-    .default('30000')
-    .transform(Number)
-    .pipe(z.number().int().min(0)),
+  DB_POOL_IDLE_TIMEOUT_MS: numeric('30000').pipe(z.number().int().min(0)),
   DB_POOL_CONNECTION_TIMEOUT_MS: z
     .string()
     .default('5000')
     .transform(Number)
     .pipe(z.number().int().min(1000).max(30000)),
-  DB_STATEMENT_TIMEOUT_MS: z
-    .string()
-    .default('30000')
-    .transform(Number)
-    .pipe(z.number().int().min(0)),
+  DB_STATEMENT_TIMEOUT_MS: numeric('30000').pipe(z.number().int().min(0)),
   DB_WORKER_POOL_MAX: z
     .string()
     .default('5')
@@ -80,12 +98,20 @@ export const envSchema = z.object({
     .pipe(z.number().int().min(100).max(60000)),
 
   // Redis
-  REDIS_URL: z.string().url({ message: 'REDIS_URL must be a valid URL' }),
+  REDIS_URL: z
+    .string({ message: 'REDIS_URL is required' })
+    .url({ message: 'REDIS_URL must be a valid URL' }),
 
   // Auth
   JWT_SECRET: z
-    .string()
-    .min(32, { message: 'JWT_SECRET must be at least 32 characters' }),
+    .string({ message: 'JWT_SECRET is required' })
+    .min(32, { message: 'JWT_SECRET must be at least 32 characters' })
+    // Invariant: must contain non-whitespace content. A blank-but-long secret
+    // satisfies the length check while remaining trivially guessable, so it
+    // would be accepted at boot and used to sign every token.
+    .refine((val) => val.trim().length > 0, {
+      message: 'JWT_SECRET must not be blank',
+    }),
   JWT_EXPIRY: z.string().default('1h'),
 
   // JWT key rotation
@@ -94,22 +120,14 @@ export const envSchema = z.object({
     .default('86400')
     .transform(Number)
     .pipe(z.number().int().positive()),
-  KEY_GRACE_PERIOD_SECONDS: z
-    .string()
-    .default('3600')
-    .transform(Number)
-    .pipe(z.number().int().nonnegative()),
+  KEY_GRACE_PERIOD_SECONDS: numeric('3600').pipe(z.number().int().nonnegative()),
   /**
    * Clock skew tolerance in seconds.
    * Added to the grace window before a retired key is hard-pruned, and passed
    * as `clockTolerance` to jwtVerify() so tokens from slightly-fast clocks verify.
    * Default: 300 (5 minutes).
    */
-  KEY_CLOCK_SKEW_SECONDS: z
-    .string()
-    .default('300')
-    .transform(Number)
-    .pipe(z.number().int().nonnegative()),
+  KEY_CLOCK_SKEW_SECONDS: numeric('300').pipe(z.number().int().nonnegative()),
 
   // JWT key rotation — private key source
   KEY_PRIVATE_PEM: z.string().optional(),
@@ -265,49 +283,39 @@ export const envSchema = z.object({
     .pipe(z.number().int().min(1)),
   RATE_LIMIT_FAIL_OPEN: z
     .string()
-    .optional()
-    .transform((val) => {
-      // Explicit env var always wins; default is fail-closed in production
-      if (val !== undefined) return val === 'true'
-      return process.env.NODE_ENV !== 'production'
-    }),
+    .optional(),
+    // Resolution of the unset case is deferred to mapEnvToConfig, which has
+    // access to the same `env` object as every other field. Reading
+    // `process.env.NODE_ENV` here instead would make the result depend on
+    // ambient process state rather than the validated input, so a production
+    // deployment could silently fail OPEN — letting unbounded traffic through
+    // when the rate-limit store is unavailable.
 
   // Credits / billing
   ENDPOINT_COST_WEIGHTS: z.string().default('{"default":1,"/bulk/verify":10,"/reports":5}'),
-  DEFAULT_MONTHLY_CREDITS: z
-    .string()
-    .default('10000')
-    .transform(Number)
-    .pipe(z.number().int().min(0)),
+  DEFAULT_MONTHLY_CREDITS: numeric('10000').pipe(z.number().int().min(0)),
 
   // Reputation scoring model
   REPUTATION_MODEL_VERSION: z.string().default('1.0.0'),
-  REPUTATION_BOND_SCORE_MAX: z
-    .string()
-    .default('50')
-    .transform(Number)
-    .pipe(z.number().min(0).max(100)),
-  REPUTATION_DURATION_SCORE_MAX: z
-    .string()
-    .default('20')
-    .transform(Number)
-    .pipe(z.number().min(0).max(100)),
-  REPUTATION_ATTESTATION_SCORE_MAX: z
-    .string()
-    .default('30')
-    .transform(Number)
-    .pipe(z.number().min(0).max(100)),
+  REPUTATION_BOND_SCORE_MAX: numeric('50').pipe(z.number().min(0).max(100)),
+  REPUTATION_DURATION_SCORE_MAX: numeric('20').pipe(z.number().min(0).max(100)),
+  REPUTATION_ATTESTATION_SCORE_MAX: numeric('30').pipe(
+    z.number().min(0).max(100),
+  ),
   REPUTATION_ONE_ETH_WEI: z
     .string()
     .default('1000000000000000000')
+    // Invariant: must be a positive BigInt. It is the divisor that converts wei
+    // to ETH in trust-score math, so `0` would produce Infinity/NaN and a
+    // negative value would invert the bond component — silently corrupting
+    // every score rather than failing at boot.
     .refine((val) => {
       try {
-        BigInt(val)
-        return true
+        return BigInt(val) > 0n
       } catch {
         return false
       }
-    }, { message: 'REPUTATION_ONE_ETH_WEI must be a valid BigInt string' }),
+    }, { message: 'REPUTATION_ONE_ETH_WEI must be a positive BigInt string' }),
   REPUTATION_MAX_DURATION_DAYS: z
     .string()
     .default('365')
@@ -337,11 +345,9 @@ export const envSchema = z.object({
     .pipe(z.number().int().min(1).max(3650)),
 
   // Report generation
-  REPORT_MAX_CONCURRENT_JOBS_PER_ORG: z
-    .string()
-    .default('10')
-    .transform(Number)
-    .pipe(z.number().int().min(0).max(1000)),
+  REPORT_MAX_CONCURRENT_JOBS_PER_ORG: numeric('10').pipe(
+    z.number().int().min(0).max(1000),
+  ),
 })
 
 export type Env = z.infer<typeof envSchema>
@@ -461,16 +467,48 @@ export interface Config {
   }
 }
 
+/** Fallback cost weight used when none can be parsed from the environment. */
+const DEFAULT_COST_WEIGHT = 1
+
+/**
+ * Parses the endpoint cost-weight map used for credit metering.
+ *
+ * Invariant: every value must be a finite, non-negative number, and the result
+ * must always carry a usable `default`. Weights are applied directly to credit
+ * balances, so a negative weight would *credit* an account on every request and
+ * a non-numeric weight would make the balance comparison NaN-false and write
+ * NaN into the ledger. Any violation therefore degrades to the default rather
+ * than being passed through to billing.
+ */
 function parseCostWeights(raw: string): Record<string, number> {
+  const fallback: Record<string, number> = { default: DEFAULT_COST_WEIGHT };
+
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(raw)
-    if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
-      return parsed as Record<string, number>
-    }
-    return { default: 1 }
+    parsed = JSON.parse(raw);
   } catch {
-    return { default: 1 }
+    return fallback;
   }
+
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return fallback;
+  }
+
+  const weights: Record<string, number> = {};
+  for (const [path, weight] of Object.entries(parsed as Record<string, unknown>)) {
+    if (typeof weight === 'number' && Number.isFinite(weight) && weight >= 0) {
+      weights[path] = weight;
+    }
+  }
+
+  // A usable default is required: resolveCostWeight falls back to
+  // `costWeights['default'] ?? 1` only after every pattern has missed, and an
+  // empty map would otherwise make "unset" indistinguishable from "free".
+  if (weights.default === undefined) {
+    weights.default = DEFAULT_COST_WEIGHT;
+  }
+
+  return weights;
 }
 
 function hasRetryOverride(overrides: RetryPolicyOverrides): boolean {
@@ -606,7 +644,13 @@ function mapEnvToConfig(env: Env): Config {
       maxFree: env.RATE_LIMIT_MAX_FREE,
       maxPro: env.RATE_LIMIT_MAX_PRO,
       maxEnterprise: env.RATE_LIMIT_MAX_ENTERPRISE,
-      failOpen: env.RATE_LIMIT_FAIL_OPEN,
+      // An explicit env var always wins; otherwise fail-closed in production.
+      // `env.NODE_ENV` is the value parsed from the same input as every other
+      // field, so this decision is reproducible from the validated env alone.
+      failOpen:
+        env.RATE_LIMIT_FAIL_OPEN === undefined
+          ? env.NODE_ENV !== 'production'
+          : env.RATE_LIMIT_FAIL_OPEN === 'true',
     },
     reputation: {
       scoringModelVersion: env.REPUTATION_MODEL_VERSION,
