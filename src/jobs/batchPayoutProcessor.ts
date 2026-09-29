@@ -58,6 +58,12 @@ export interface PayoutExecutor {
 
 export interface BatchPayoutOptions {
   logger?: (message: string) => void
+  /**
+   * Maximum number of items allowed in a single batch.
+   * Defaults to 1000. Prevents unbounded memory use and unreasonably
+   * large transactions from being submitted in one call.
+   */
+  maxBatchSize?: number
 }
 
 /**
@@ -67,9 +73,23 @@ export interface BatchPayoutOptions {
  * failure never corrupts the status of other items in the batch.
  * Failed items are marked as retry-eligible; already-processed
  * (duplicate) items are skipped.
+ *
+ * Invariants:
+ * - Validation happens up front before any side effects (atomic semantics).
+ * - A given item is executed at most once per `process()` call.
+ * - Duplicate transaction hashes within the same batch are detected and
+ *   only the first occurrence is executed; later ones are skipped.
+ * - Execution failures are persisted as `failed` (best effort) and are
+ *   retry-eligible.
+ * - Successful execution with a failed final upsert is retry-eligible.
+ * - Concurrent ``process()`` calls are serialized per instance to avoid
+ *   interleaved writes to the same transaction hash.
  */
 export class BatchPayoutProcessor {
   private readonly logger: (message: string) => void
+  private readonly maxBatchSize: number
+  /** Serializes concurrent `process()` calls on this instance. */
+  private inProgress: Promise<BatchPayoutResult> | null = null
 
   constructor(
     private readonly store: PayoutSettlementStore,
@@ -77,6 +97,11 @@ export class BatchPayoutProcessor {
     options: BatchPayoutOptions = {},
   ) {
     this.logger = options.logger ?? (() => {})
+    const maxBatchSize = options.maxBatchSize ?? 1000
+    if (!Number.isInteger(maxBatchSize) || maxBatchSize < 1) {
+      throw new ValidationError('maxBatchSize must be a positive integer')
+    }
+    this.maxBatchSize = maxBatchSize
   }
 
   /**
@@ -86,6 +111,11 @@ export class BatchPayoutProcessor {
   public validatePayload(items: PayoutItem[]): void {
     if (!Array.isArray(items)) {
       throw new ValidationError('Batch payout payload must be an array of items')
+    }
+    if (items.length > this.maxBatchSize) {
+      throw new ValidationError(
+        `Batch payout payload exceeds maximum batch size of ${this.maxBatchSize} (counted ${items.length})`,
+      )
     }
     for (let i = 0; i < items.length; i++) {
       const item = items[i]
@@ -120,6 +150,21 @@ export class BatchPayoutProcessor {
   }
 
   async process(items: PayoutItem[]): Promise<BatchPayoutResult> {
+    // Serialize concurrent calls on this instance so two batches cannot
+    // interleave writes for the same transaction hash.
+    if (this.inProgress) {
+      throw new ValidationError('BatchPayoutProcessor is already processing a batch; concurrent calls are not allowed')
+    }
+    const run = this.processInternal(items)
+    this.inProgress = run
+    try {
+      return await run
+    } finally {
+      this.inProgress = null
+    }
+  }
+
+  private async processInternal(items: PayoutItem[]): Promise<BatchPayoutResult> {
     this.validatePayload(items)
     const startTime = new Date().toISOString()
     const startMs = Date.now()
@@ -129,7 +174,25 @@ export class BatchPayoutProcessor {
     let failed = 0
     let skipped = 0
 
+    // Deduplicate transaction hashes within the batch. The first occurrence
+    // is executed; later ones are skipped without touching the store or the
+    // executor. This prevents double-spending within a single batch.
+    const seenHashes = new Set<string>()
+
     for (const item of items) {
+      if (seenHashes.has(item.transactionHash)) {
+        this.logger(`Skipping duplicate transaction hash in batch: ${item.transactionHash}`)
+        results.push({
+          bondId: item.bondId,
+          transactionHash: item.transactionHash,
+          status: 'pending',
+          retryEligible: false,
+        })
+        skipped++
+        continue
+      }
+      seenHashes.add(item.transactionHash)
+
       const result = await this.processItem(item)
       results.push(result)
 
@@ -259,5 +322,5 @@ export function getRetryableItems(
       .filter((r) => r.retryEligible)
       .map((r) => r.transactionHash),
   )
-  return original.filter((item) => retryHashes.has(item.transactionHash))
+  return original.filter((item) => retryHashs.has(item.transactionHash))
 }
