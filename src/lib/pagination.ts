@@ -1,3 +1,6 @@
+import { createHmac } from 'crypto'
+import { loadConfig } from '../config/index.js'
+
 export const DEFAULT_PAGE = 1
 export const DEFAULT_LIMIT = 20
 export const MAX_LIMIT = 100
@@ -123,7 +126,19 @@ export function parsePaginationParams(
     typeof query.cursor === 'string' && query.cursor.trim() !== ''
       ? query.cursor
       : null
-  const decodedCursor = rawCursor ? decodeCursor(rawCursor) : undefined
+
+  let decodedCursor: DecodedCursor | undefined
+  if (rawCursor) {
+    try {
+      decodedCursor = decodeCursor(rawCursor) ?? undefined
+    } catch (error) {
+      if (error instanceof PaginationValidationError) {
+        errors.push(...error.details)
+      } else {
+        throw error
+      }
+    }
+  }
 
   // Backwards compatibility: allow client to pass offset via ?cursor=10
   // But ONLY if it parses as an integer and is NOT a valid encoded cursor
@@ -214,17 +229,35 @@ export function buildCursorPaginationMeta(
 
 export function encodeCursor(timestamp: string | Date, id: string): string {
   const t = timestamp instanceof Date ? timestamp.toISOString() : timestamp
-  return Buffer.from(JSON.stringify({ t, i: id }), 'utf8').toString('base64url')
+  const payload = JSON.stringify({ t, i: id })
+  const secret = loadConfig().jwt.secret
+  const h = createHmac('sha256', secret).update(payload).digest('hex')
+  return Buffer.from(JSON.stringify({ t, i: id, h }), 'utf8').toString('base64url')
 }
 
 export function decodeCursor(cursor: string): DecodedCursor | null {
   try {
-    const parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as Partial<DecodedCursor>
+    const parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as Partial<DecodedCursor & { h: string }>
     if (typeof parsed.t !== 'string' || typeof parsed.i !== 'string') {
       return null
     }
+
+    if (typeof parsed.h !== 'string') {
+      throw new PaginationValidationError([{ path: 'cursor', message: 'Cursor signature missing' }])
+    }
+
+    const payload = JSON.stringify({ t: parsed.t, i: parsed.i })
+    const secret = loadConfig().jwt.secret
+    const expected = createHmac('sha256', secret).update(payload).digest('hex')
+    if (parsed.h !== expected) {
+      throw new PaginationValidationError([{ path: 'cursor', message: 'Cursor has been tampered with' }])
+    }
+
     return { t: parsed.t, i: parsed.i }
-  } catch {
+  } catch (error) {
+    if (error instanceof PaginationValidationError) {
+      throw error
+    }
     return null
   }
 }
@@ -248,4 +281,93 @@ export function buildCursorEnvelope<T>(
       limit: options.limit,
     },
   }
+}
+
+/**
+ * HATEOAS pagination links for offset-based pagination.
+ * Maps relation names to fully qualified URLs.
+ */
+export interface PaginationLinks {
+  self: string
+  first?: string
+  prev?: string
+  next?: string
+  last?: string
+}
+
+/**
+ * Build HATEOAS pagination links for offset/page-based responses.
+ *
+ * @param requestUrl - The full URL of the current request (protocol + host + path + query).
+ * @param page       - The current page number.
+ * @param limit      - The page size.
+ * @param total      - Total number of matching records.
+ * @returns A PaginationLinks object with self, first, prev, next, and last links as applicable.
+ */
+export function buildPaginationLinks(
+  requestUrl: string,
+  page: number,
+  limit: number,
+  total: number,
+): PaginationLinks {
+  const url = new URL(requestUrl)
+  url.searchParams.set('page', String(page))
+  url.searchParams.set('limit', String(limit))
+  url.searchParams.delete('offset')
+  const self = url.toString()
+
+  const totalPages = Math.ceil(total / limit)
+  const links: PaginationLinks = { self }
+
+  if (total <= 0) return links
+
+  if (totalPages > 1) {
+    url.searchParams.set('page', String(1))
+    links.first = url.toString()
+  }
+
+  if (page > 1) {
+    url.searchParams.set('page', String(page - 1))
+    links.prev = url.toString()
+  }
+
+  if (page < totalPages) {
+    url.searchParams.set('page', String(page + 1))
+    links.next = url.toString()
+  }
+
+  if (totalPages > 1) {
+    url.searchParams.set('page', String(totalPages))
+    links.last = url.toString()
+  }
+
+  return links
+}
+
+/**
+ * Build HATEOAS pagination links for cursor-based responses.
+ *
+ * @param requestUrl - The full URL of the current request (protocol + host + path + query).
+ * @param limit      - The page size.
+ * @param nextCursor - The cursor for the next page, or null/undefined if there are no more results.
+ * @returns A PaginationLinks object with self and optionally next links.
+ */
+export function buildCursorPaginationLinks(
+  requestUrl: string,
+  limit: number,
+  nextCursor?: string | null,
+): PaginationLinks {
+  const url = new URL(requestUrl)
+  url.searchParams.set('limit', String(limit))
+  url.searchParams.delete('cursor')
+  const self = url.toString()
+
+  const links: PaginationLinks = { self }
+
+  if (nextCursor) {
+    url.searchParams.set('cursor', nextCursor)
+    links.next = url.toString()
+  }
+
+  return links
 }

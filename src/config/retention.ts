@@ -16,6 +16,16 @@ export interface EntityRetentionConfig {
   ttlDays: number
 }
 
+export interface OrgRetentionOverrides {
+  [orgId: string]: Partial<{
+    scoreHistory: EntityRetentionConfig
+    auditLogs: EntityRetentionConfig
+    slashEvents: EntityRetentionConfig
+    outboxEvents: EntityRetentionConfig
+    evidence: EntityRetentionConfig
+  }>
+}
+
 export interface RetentionConfig {
   /**
    * When true the job logs what *would* be deleted without touching the DB.
@@ -34,6 +44,9 @@ export interface RetentionConfig {
     outboxEvents: EntityRetentionConfig
     evidence: EntityRetentionConfig
   }
+
+  /** Per-org retention TTL overrides indexed by orgId / tenantId. */
+  orgOverrides?: OrgRetentionOverrides
 }
 
 export interface FailedInboundSweeperConfig {
@@ -184,6 +197,30 @@ function parseBoundedInt(
   return Math.floor(parsed);
 }
 
+export function getEffectiveEntityTtl(
+  config: RetentionConfig,
+  entity: keyof RetentionConfig['entities'],
+  orgId?: string,
+): number {
+  if (orgId && config.orgOverrides?.[orgId]?.[entity]?.ttlDays !== undefined) {
+    return config.orgOverrides[orgId]![entity]!.ttlDays
+  }
+  return config.entities[entity].ttlDays
+}
+
+function parseOrgOverrides(raw: string | undefined): OrgRetentionOverrides | undefined {
+  if (!raw) return undefined
+  try {
+    const parsed = JSON.parse(raw)
+    if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+      return parsed as OrgRetentionOverrides
+    }
+  } catch {
+    // Ignore invalid JSON in env var, fallback to undefined
+  }
+  return undefined
+}
+
 export function loadRetentionConfig(
   env: Record<string, string | undefined> = process.env,
   defaults: RetentionConfig = DEFAULT_RETENTION_CONFIG,
@@ -240,6 +277,7 @@ export function loadRetentionConfig(
         ),
       },
     },
+    orgOverrides: parseOrgOverrides(env.RETENTION_ORG_OVERRIDES) ?? defaults.orgOverrides,
   }
 }
 

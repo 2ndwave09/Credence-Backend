@@ -16,6 +16,13 @@ export const rateLimitRejectedTotal = new client.Counter({
   registers: [register],
 })
 
+export const rateLimitHitsTotal = new client.Counter({
+  name: 'rate_limit_hits_total',
+  help: 'Total number of rate limit hits grouped by tenant and subscription tier',
+  labelNames: ['tenant', 'tier'],
+  registers: [register],
+})
+
 // ── Public types ──────────────────────────────────────────────────────────────
 
 export interface RateLimitConfig {
@@ -25,19 +32,62 @@ export interface RateLimitConfig {
   max?: number
   /** Window in seconds */
   windowSec: number
+  /**
+   * Redis-down behaviour override for the per-route `rateLimit()` helper.
+   * When omitted the default is derived from NODE_ENV (fail-closed in
+   * production, fail-open otherwise).  Has no effect when using
+   * `createRateLimitMiddleware` directly — use `Config.rateLimit.failOpen`
+   * instead.
+   */
+  failOpen?: boolean
   /** Function to extract tenant identifier from request */
   getTenantId?: (req: Request) => string | undefined
+  /** Include method/path in the bucket identity for route-scoped limits. */
+  includeRoute?: boolean
+  /** Function to resolve tenant-specific rate-limit override if configured */
+  getTenantOverride?: (tenantId: string) => Promise<{ rateLimit: number; windowSize: number } | null>
   /**
    * Optional Redis client getter — injected in tests to simulate failures.
    * Defaults to `RedisConnection.getInstance().getClient()`.
    */
-  getRedis?: () => { incr(k: string): Promise<number>; expire(k: string, s: number): Promise<number | void>; ttl(k: string): Promise<number> }
+  getRedis?: () => RateLimitRedis
+}
+
+export interface RateLimitRedis {
+  incr(k: string): Promise<number>
+  expire(k: string, s: number): Promise<number | void>
+  ttl(k: string): Promise<number>
+  /** Redis EVAL is optional so small unit-test doubles remain compatible. */
+  eval?: (script: string, options: { keys: string[]; arguments: string[] }) => Promise<unknown>
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function hashIdentifier(raw: string): string {
   return createHash('sha256').update(raw).digest('hex').slice(0, 16)
+}
+
+/**
+ * Return the real client IP for rate-limiting purposes.
+ *
+ * Threat model: when Express `trust proxy` is enabled, `req.ip` is derived
+ * from the *leftmost* entry in `X-Forwarded-For`, which is fully
+ * attacker-controlled.  An adversary can set
+ *   X-Forwarded-For: <any-ip>, <legitimate-proxy>
+ * and `req.ip` will return `<any-ip>`, letting them cycle through arbitrary
+ * IPs to bypass per-IP rate limiting.
+ *
+ * Defence: ignore `req.ip` and `X-Forwarded-For` entirely.  Use
+ * `req.socket.remoteAddress` — the IP of the TCP peer that delivered the
+ * request to this process.  In a correctly configured deployment that IP is
+ * always a trusted reverse proxy (or the client directly when no proxy is
+ * present), so it cannot be spoofed at the application layer.
+ *
+ * Performance: two property reads and a string fallback — negligible on any
+ * hot path.  No allocation beyond the constant fallback string.
+ */
+export function getClientIp(req: Request): string {
+  return req.socket?.remoteAddress ?? 'unknown'
 }
 
 /**
@@ -101,16 +151,48 @@ function setRateLimitHeaders(
 // ── Core fixed-window check ───────────────────────────────────────────────────
 
 /**
+ * INCR followed by EXPIRE is not a transaction: a worker can be interrupted
+ * between the two commands, leaving a bucket without an expiry. Lua executes
+ * the whole sequence atomically on Redis's single command thread.
+ */
+const ATOMIC_FIXED_WINDOW_SCRIPT = `
+local count = redis.call('INCR', KEYS[1])
+if count == 1 then
+  redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+local ttl = redis.call('TTL', KEYS[1])
+return { count, ttl }
+`
+
+/**
  * Increment a fixed-window counter in Redis and return whether the request
  * is within the allowed budget.
  *
  * Returns `{ count, ttl }` so the caller can set headers and decide to block.
  */
 async function checkWindow(
-  redis: { incr(k: string): Promise<number>; expire(k: string, s: number): Promise<number | void>; ttl(k: string): Promise<number> },
+  redis: RateLimitRedis,
   key: string,
   windowSec: number,
 ): Promise<{ count: number; ttl: number }> {
+  if (redis.eval) {
+    const result = await redis.eval(ATOMIC_FIXED_WINDOW_SCRIPT, {
+      keys: [key],
+      arguments: [String(windowSec)],
+    })
+    if (!Array.isArray(result) || result.length < 2) {
+      throw new Error('rate limiter returned an invalid atomic result')
+    }
+    const count = Number(result[0])
+    const ttl = Number(result[1])
+    if (!Number.isFinite(count) || !Number.isFinite(ttl)) {
+      throw new Error('rate limiter returned non-numeric atomic values')
+    }
+    return { count, ttl: ttl > 0 ? ttl : windowSec }
+  }
+
+  // Compatibility path for minimal adapters and existing test doubles. The
+  // production redis client exposes eval and therefore uses the atomic path.
   const count = await redis.incr(key)
   if (count === 1) await redis.expire(key, windowSec)
   const ttl = await redis.ttl(key)
@@ -142,6 +224,7 @@ export function createRateLimitMiddleware(
     namespace = 'ratelimit:api',
     windowSec = config.windowSec,
     getTenantId: customGetTenantId,
+    includeRoute = false,
     getRedis = () => RedisConnection.getInstance().getClient(),
   } = options ?? {}
 
@@ -151,56 +234,84 @@ export function createRateLimitMiddleware(
     const tenantId = customGetTenantId?.(req) ?? getTenantId(req)
     const keyId    = getKeyId(req)
     const tier     = getTier(req)
-    const tierMax  = resolveTierLimit(tier, config)
+
+    let effectiveTierMax = resolveTierLimit(tier, config)
+    let effectiveWindowSec = windowSec
+
+    if (tenantId && options?.getTenantOverride) {
+      try {
+        const override = await options.getTenantOverride(tenantId)
+        if (override) {
+          effectiveTierMax = override.rateLimit
+          effectiveWindowSec = override.windowSize
+        }
+      } catch {
+        // Fall back to tier limit if override lookup fails
+      }
+    }
+
     // Per-key limit: explicit override or same as tier ceiling
-    const keyMax   = options?.max ?? tierMax
+    const keyMax   = options?.max ?? effectiveTierMax
 
-    const ip = req.ip ?? req.socket.remoteAddress ?? 'unknown'
-    const tenantSegment = tenantId ? `tenant:${tenantId}` : `ip:${ip}`
+    // Use getClientIp instead of req.ip to prevent X-Forwarded-For spoofing.
+    // See getClientIp for the full threat model and rationale.
+    const ip = getClientIp(req)
+    const route = `${req.method}:${req.baseUrl}${req.path}`
+    const identity = tenantId ? `tenant:${tenantId}` : `ip:${ip}`
+    // Hash every user-controlled dimension before putting it in a Redis key:
+    // tenant IDs and paths cannot create ambiguous separators or unbounded key
+    // sizes, while route and tenant identity remain independently represented.
+    const routeScope = includeRoute ? `|route:${route}` : ''
+    const tenantScope = hashIdentifier(`${identity}${routeScope}`)
 
-    const now         = Math.floor(Date.now() / 1000)
-    const windowStart = now - (now % windowSec)
-    const resetTime   = windowStart + windowSec
+    const now = Math.floor(Date.now() / 1000)
+    const windowId = Math.floor(now / effectiveWindowSec)
 
-    const tenantKey = `${namespace}:${tenantSegment}:${windowStart}`
-    const keyBucket = keyId ? `${namespace}:key:${keyId}:${windowStart}` : null
+    const tenantKey = `${namespace}:tenant:${tenantScope}:${windowId}`
+    // Per-key bucket keyed by key id + tier ceiling so a key that changes
+    // tiers (e.g. upgrade from free to pro) gets a fresh counter scoped to
+    // the new tier rather than inheriting the old tier's budget.
+    const keyRoute = includeRoute ? `|route:${route}` : ''
+    const keyBucket = keyId ? `${namespace}:key:${keyId}:${tier}${keyRoute}:${windowId}` : null
 
     try {
       const redis = getRedis()
 
       // Check tenant-level bucket (tier ceiling)
-      const { count: tenantCount, ttl: tenantTtl } = await checkWindow(redis, tenantKey, windowSec)
+      const { count: tenantCount, ttl: tenantTtl } = await checkWindow(redis, tenantKey, effectiveWindowSec)
 
-      if (tenantCount > tierMax) {
+      if (tenantCount > effectiveTierMax) {
         rateLimitRejectedTotal.inc({ tier, key_id: keyId ?? 'none', reason: 'tenant_limit' })
-        setRateLimitHeaders(res, { limit: tierMax, remaining: 0, reset: now + tenantTtl, retryAfter: tenantTtl })
-        next(new AppError('Rate limit exceeded. Try again later.', ErrorCode.RATE_LIMIT_EXCEEDED, 429, { retryAfter: tenantTtl, limit: tierMax, windowSec }))
+        rateLimitHitsTotal.inc({ tenant: tenantId ?? 'unknown', tier })
+        setRateLimitHeaders(res, { limit: effectiveTierMax, remaining: 0, reset: now + tenantTtl, retryAfter: tenantTtl })
+        next(new AppError('Rate limit exceeded. Try again later.', ErrorCode.RATE_LIMIT_EXCEEDED, 429, { retryAfter: tenantTtl, limit: effectiveTierMax, windowSec: effectiveWindowSec }))
         return
       }
 
       // Check per-key bucket (key ceiling)
       if (keyBucket) {
-        const { count: keyCount, ttl: keyTtl } = await checkWindow(redis, keyBucket, windowSec)
+        const { count: keyCount, ttl: keyTtl } = await checkWindow(redis, keyBucket, effectiveWindowSec)
 
         if (keyCount > keyMax) {
           rateLimitRejectedTotal.inc({ tier, key_id: keyId!, reason: 'key_limit' })
+          rateLimitHitsTotal.inc({ tenant: tenantId ?? 'unknown', tier })
           setRateLimitHeaders(res, { limit: keyMax, remaining: 0, reset: now + keyTtl, retryAfter: keyTtl })
-          next(new AppError('Rate limit exceeded. Try again later.', ErrorCode.RATE_LIMIT_EXCEEDED, 429, { retryAfter: keyTtl, limit: keyMax, windowSec }))
+          next(new AppError('Rate limit exceeded. Try again later.', ErrorCode.RATE_LIMIT_EXCEEDED, 429, { retryAfter: keyTtl, limit: keyMax, windowSec: effectiveWindowSec }))
           return
         }
 
         // Remaining is the tighter of the two budgets
-        const remaining = Math.min(tierMax - tenantCount, keyMax - keyCount)
-        setRateLimitHeaders(res, { limit: keyMax, remaining, reset: resetTime })
+        const remaining = Math.min(effectiveTierMax - tenantCount, keyMax - keyCount)
+        setRateLimitHeaders(res, { limit: keyMax, remaining, reset: now + Math.min(tenantTtl, keyTtl) })
       } else {
-        setRateLimitHeaders(res, { limit: tierMax, remaining: tierMax - tenantCount, reset: resetTime })
+        setRateLimitHeaders(res, { limit: effectiveTierMax, remaining: effectiveTierMax - tenantCount, reset: now + tenantTtl })
       }
 
       next()
     } catch (err) {
       if (config.failOpen) {
         // Fail-open: let the request through, surface headers with full budget
-        setRateLimitHeaders(res, { limit: tierMax, remaining: tierMax, reset: resetTime })
+        setRateLimitHeaders(res, { limit: effectiveTierMax, remaining: effectiveTierMax, reset: now + effectiveWindowSec })
         return next()
       }
 
@@ -211,8 +322,17 @@ export function createRateLimitMiddleware(
   }
 }
 
-/** Backward-compatible helper that accepts only per-route rate-limit options. */
+/**
+ * Backward-compatible helper that accepts only per-route rate-limit options.
+ *
+ * Defaults to fail-closed in production and fail-open in dev/test so that a
+ * misconfigured per-route limiter never silently disables protection.
+ */
 export function rateLimit(options: RateLimitConfig) {
+  // Honour an explicit failOpen on the options when provided, otherwise
+  // default fail-closed in production for safety.
+  const failOpen = options.failOpen ?? (process.env.NODE_ENV !== 'production')
+
   return createRateLimitMiddleware(
     {
       enabled: true,
@@ -220,7 +340,7 @@ export function rateLimit(options: RateLimitConfig) {
       maxFree: options.max ?? 100,
       maxPro: options.max ?? 100,
       maxEnterprise: options.max ?? 100,
-      failOpen: true,
+      failOpen,
     },
     options,
   )

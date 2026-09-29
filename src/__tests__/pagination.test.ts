@@ -4,6 +4,10 @@ import { AttestationsRepository, type Attestation } from '../db/repositories/att
 import { newDb } from 'pg-mem'
 import { Pool } from 'pg'
 
+process.env.JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long'
+process.env.DB_URL = 'postgres://x:x@localhost/x'
+process.env.REDIS_URL = 'redis://localhost:6379'
+
 describe('Cursor Pagination', () => {
   describe('encodeCursor & decodeCursor', () => {
     it('should encode and decode cursor correctly', () => {
@@ -136,6 +140,18 @@ describe('Cursor Pagination', () => {
           expect(error.details.some(d => d.path === 'cursor')).toBe(true)
         }
       }
+    })
+
+    it('should reject a tampered cursor (negative test)', () => {
+      const validCursor = encodeCursor('2024-01-15T10:30:00.000Z', '123')
+      const decodedPayload = JSON.parse(Buffer.from(validCursor, 'base64url').toString('utf8'))
+      
+      // Tamper with the id to skip ahead
+      decodedPayload.i = '999' 
+      
+      const tamperedCursor = Buffer.from(JSON.stringify(decodedPayload), 'utf8').toString('base64url')
+      
+      expect(() => parsePaginationParams({ cursor: tamperedCursor })).toThrow(PaginationValidationError)
     })
   })
 

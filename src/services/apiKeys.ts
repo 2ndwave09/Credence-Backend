@@ -1,8 +1,30 @@
 import { randomBytes, createHash } from 'crypto'
 import { ApiKeysRepository } from '../db/repositories/apiKeysRepository.js'
 import { pool } from '../db/pool.js'
+import { SingleFlight } from '../lib/singleflight.js'
 
-export type KeyScope = 'read' | 'full' | string   // extended to accept granular scope strings
+// ── Scope constants ──────────────────────────────────────────────────────────
+
+export const ApiKeyScope = {
+  TRUST_READ: 'trust:read',
+  ATTESTATIONS_READ: 'attestations:read',
+  ATTESTATIONS_WRITE: 'attestations:write',
+  PAYOUTS_WRITE: 'payouts:write',
+  REPORTS_GENERATE: 'reports:generate',
+  EXPORTS_READ: 'exports:read',
+  WEBHOOKS_ADMIN: 'webhooks:admin',
+  OUTBOX_REINJECT: 'outbox:reinject',
+  ADMIN_READ: 'admin:read',
+  ADMIN_WRITE: 'admin:write',
+  FLAGS_READ: 'flags:read',
+  FLAGS_WRITE: 'flags:write',
+  BOND_READ: 'bond:read',
+  BOND_WRITE: 'bond:write',
+} as const
+
+export type ApiKeyScope = (typeof ApiKeyScope)[keyof typeof ApiKeyScope]
+
+export type KeyScope = 'read' | 'full' | string
 export type SubscriptionTier = 'free' | 'pro' | 'enterprise'
 
 export interface StoredApiKey {
@@ -15,7 +37,7 @@ export interface StoredApiKey {
    * Granted scopes for this key.
    *
    * Legacy keys carry a single-element array with 'read' or 'full'.
-   * Granular keys carry one or more scope strings from ApiScope.
+   * Granular keys carry one or more scope strings from ApiKeyScope.
    *
    * The `scope` field (singular) is kept for backward compatibility and
    * reflects the primary / most-privileged scope in the array.
@@ -49,6 +71,17 @@ const repository = new ApiKeysRepository(pool)
 const inMemoryStore = new Map<string, StoredApiKey>()
 let useInMemory = process.env.NODE_ENV === 'test' && !process.env.TEST_WITH_DB
 
+/**
+ * Per-key singleflight guard for `validateApiKey`.
+ *
+ * Coalesces concurrent validation calls for the same raw key so that only one
+ * hash comparison + store look-up runs at a time.  All concurrent callers with
+ * the same key share a single result.  This prevents thundering-herd stampedes
+ * during burst traffic and closes the check-time / use-time (TOCTOU) window
+ * where a revocation races an in-flight look-up.
+ */
+const validateSingleFlight = new SingleFlight()
+
 function hashKey(rawKey: string): string {
   return createHash('sha256').update(rawKey).digest('hex')
 }
@@ -62,23 +95,22 @@ function extractPrefix(rawKey: string): string {
  * Generate and store a new API key.
  *
  * @param ownerId  Identifier of the key owner (user/org ID)
- * @param scope    Primary access scope: 'read' (default) or 'full', or a granular scope string
+ * @param scopeOrScopes Primary scope or array of scopes.
  * @param tier     Subscription tier controlling rate limits (default: 'free')
- * @param scopes   Optional explicit list of granted scopes. When provided, overrides `scope`.
  * @returns        Key metadata including the raw key (shown once only)
  */
-export async function generateApiKey(
+export function generateApiKey(
   ownerId: string,
-  scopes: KeyScope[] = [],
+  scope: KeyScope | KeyScope[] = 'read',
   tier: SubscriptionTier = 'free',
   scopes?: string[],
 ): CreateApiKeyResult {
-  const random = randomBytes(32).toString('hex') // 64 hex chars
-  const rawKey = `cr_${random}` // 67 chars total
+  const random = randomBytes(32).toString('hex')
+  const rawKey = `cr_${random}`
   const prefix = extractPrefix(rawKey)
   const id = randomBytes(8).toString('hex')
 
-  const grantedScopes = scopes ?? [scope]
+  const grantedScopes: string[] = scopes ?? (Array.isArray(scope) ? scope : [scope])
   const primaryScope = grantedScopes[0] as KeyScope
 
   const stored: StoredApiKey = {
@@ -94,9 +126,9 @@ export async function generateApiKey(
     active: true,
   }
 
-  store.set(id, stored)
+  inMemoryStore.set(id, stored)
   return {
-    id,
+    id: stored.id,
     key: rawKey,
     prefix,
     scope: primaryScope,
@@ -109,12 +141,26 @@ export async function generateApiKey(
 /**
  * Validate a raw API key.
  *
+ * Concurrent calls with the same `rawKey` are coalesced: only one underlying
+ * hash comparison + store look-up executes at a time; all concurrent callers
+ * share the result.  This prevents thundering-herd load on the key store and
+ * closes the TOCTOU window where a concurrent revocation races a validation.
+ *
  * @param rawKey  The key supplied by the caller
  * @returns       The stored key record (with lastUsedAt updated) or null if invalid/revoked
  */
 export async function validateApiKey(rawKey: string): Promise<StoredApiKey | null> {
   if (!/^cr_[0-9a-f]{64}$/.test(rawKey)) return null
 
+  // Coalesce concurrent look-ups for the same key to a single operation.
+  return validateSingleFlight.do(rawKey, () => _validateApiKeyDirect(rawKey))
+}
+
+/**
+ * Inner (non-coalesced) key validation used by the singleflight worker.
+ * Not exported — callers should always go through `validateApiKey`.
+ */
+async function _validateApiKeyDirect(rawKey: string): Promise<StoredApiKey | null> {
   const prefix = extractPrefix(rawKey)
   const hashed = hashKey(rawKey)
 
@@ -130,7 +176,10 @@ export async function validateApiKey(rawKey: string): Promise<StoredApiKey | nul
   } else {
     const apiKey = await repository.findByHashAndPrefix(hashed, prefix)
     if (apiKey) {
-      await repository.updateLastUsedAt(apiKey.id)
+      // The usage record is owner-scoped, so the owner must be carried through
+      // from the resolved key. Omitting it would leave `owner_id = NULL` in the
+      // UPDATE and silently match no rows.
+      await repository.updateLastUsedAt(apiKey.id, apiKey.ownerId)
       apiKey.lastUsedAt = new Date()
     }
     return apiKey
@@ -140,16 +189,25 @@ export async function validateApiKey(rawKey: string): Promise<StoredApiKey | nul
 /**
  * Revoke an API key by ID.
  *
+ * @param id       Opaque key ID to revoke.
+ * @param ownerId  Optional owner to scope the revocation to. Pass it whenever
+ *                 the authenticated owner is known: the store then refuses to
+ *                 touch a key owned by anybody else. Omit it only when the
+ *                 caller has already resolved and authorised the key's owner
+ *                 upstream (admin tooling, the rotation service) — that keeps
+ *                 the legacy id-only behaviour for existing callers.
  * @returns true if the key was found and deactivated, false if not found
+ *          (or not owned by `ownerId`)
  */
-export async function revokeApiKey(id: string): Promise<boolean> {
+export async function revokeApiKey(id: string, ownerId?: string): Promise<boolean> {
   if (useInMemory) {
     const key = inMemoryStore.get(id)
     if (!key) return false
+    if (ownerId !== undefined && key.ownerId !== ownerId) return false
     key.active = false
     return true
   } else {
-    return await repository.revokeApiKey(id)
+    return await repository.revokeApiKey(id, ownerId)
   }
 }
 
@@ -158,11 +216,11 @@ export async function revokeApiKey(id: string): Promise<boolean> {
  * scopes, tier, and owner. Returns null if the key doesn't exist or is already revoked.
  */
 export function rotateApiKey(id: string): CreateApiKeyResult | null {
-  const existing = store.get(id)
+  const existing = inMemoryStore.get(id)
   if (!existing || !existing.active) return null
 
   existing.active = false
-  return generateApiKey(existing.ownerId, existing.scope, existing.tier, existing.scopes)
+  return generateApiKey(existing.ownerId, existing.scopes, existing.tier)
 }
 
 /**
@@ -171,7 +229,7 @@ export function rotateApiKey(id: string): CreateApiKeyResult | null {
  * @returns Key metadata (minus `hashedKey`), or null if not found.
  */
 export function findApiKeyById(id: string): Omit<StoredApiKey, 'hashedKey'> | null {
-  const key = store.get(id)
+  const key = inMemoryStore.get(id)
   if (!key) return null
   const { hashedKey: _h, ...rest } = key
   return rest

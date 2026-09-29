@@ -1,5 +1,5 @@
 import { createHmac } from 'node:crypto'
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import {
   parseSignatureHeader,
   computeHmac,
@@ -96,6 +96,38 @@ describe('safeCompareHex', () => {
   it('returns false when lengths differ', () => {
     expect(safeCompareHex('a'.repeat(64), 'a'.repeat(32))).toBe(false)
   })
+
+  it('returns false when first argument is null', () => {
+    expect(safeCompareHex(null as unknown as string, 'a'.repeat(64))).toBe(false)
+  })
+
+  it('returns false when first argument is undefined', () => {
+    expect(safeCompareHex(undefined as unknown as string, 'a'.repeat(64))).toBe(false)
+  })
+
+  it('returns false when second argument is null', () => {
+    expect(safeCompareHex('a'.repeat(64), null as unknown as string)).toBe(false)
+  })
+
+  it('returns false when second argument is undefined', () => {
+    expect(safeCompareHex('a'.repeat(64), undefined as unknown as string)).toBe(false)
+  })
+
+  it('returns false when first argument is a number', () => {
+    expect(safeCompareHex(42 as unknown as string, 'a'.repeat(64))).toBe(false)
+  })
+
+  it('returns false when both arguments are empty strings', () => {
+    expect(safeCompareHex('', '')).toBe(false)
+  })
+
+  it('returns false gracefully when input contains non-hex characters (Buffer.from safety)', () => {
+    expect(safeCompareHex('zz'.repeat(32), 'aa'.repeat(32))).toBe(false)
+  })
+
+  it('returns false gracefully on odd-length hex string', () => {
+    expect(safeCompareHex('a'.repeat(63), 'b'.repeat(63))).toBe(false)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -103,8 +135,20 @@ describe('safeCompareHex', () => {
 // ---------------------------------------------------------------------------
 
 describe('verifySignature', () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-06-25T12:00:00.000Z'))
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
   const secret = 'test-secret'
-  const body = '{"event":"bond.created"}'
+  const body = JSON.stringify({
+    event: 'bond.created',
+    timestamp: '2026-06-25T12:00:00.000Z'
+  })
   const validSig = sign(body, secret)
 
   it('returns missing_secret when secret is null', () => {
@@ -137,6 +181,16 @@ describe('verifySignature', () => {
     expect(result).toEqual({ ok: false, reason: 'missing_signature' })
   })
 
+  it('returns missing_timestamp when body is null', () => {
+    const result = verifySignature(validSig, null as unknown as string, secret)
+    expect(result).toEqual({ ok: false, reason: 'missing_timestamp' })
+  })
+
+  it('returns missing_timestamp when body is undefined', () => {
+    const result = verifySignature(validSig, undefined as unknown as string, secret)
+    expect(result).toEqual({ ok: false, reason: 'missing_timestamp' })
+  })
+
   it('returns malformed_signature for non-hex header value', () => {
     const result = verifySignature('sha256=not-hex', body, secret)
     expect(result).toEqual({ ok: false, reason: 'malformed_signature' })
@@ -166,5 +220,72 @@ describe('verifySignature', () => {
   it('returns ok:true for sha256= prefix with uppercase', () => {
     const result = verifySignature(`SHA256=${validSig}`, body, secret)
     expect(result).toEqual({ ok: true })
+  })
+
+  describe('replay protection with fake timers', () => {
+    beforeEach(() => {
+      vi.useFakeTimers({ toFake: ['Date'] })
+      vi.setSystemTime(new Date('2026-06-25T12:00:00.000Z'))
+    })
+
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    it('rejects payload when timestamp is missing', () => {
+      const payload = '{"event":"bond.created","data":{}}'
+      const sig = sign(payload, secret)
+      const result = verifySignature(sig, payload, secret)
+      expect(result).toEqual({ ok: false, reason: 'missing_timestamp' })
+    })
+
+    it('rejects payload when timestamp is malformed', () => {
+      const payload = '{"event":"bond.created","timestamp":"not-a-date","data":{}}'
+      const sig = sign(payload, secret)
+      const result = verifySignature(sig, payload, secret)
+      expect(result).toEqual({ ok: false, reason: 'invalid_timestamp' })
+    })
+
+    it('rejects payload when timestamp is expired (older than default 5 mins)', () => {
+      const payload = '{"event":"bond.created","timestamp":"2026-06-25T11:54:59.000Z","data":{}}' // 5m 1s ago
+      const sig = sign(payload, secret)
+      const result = verifySignature(sig, payload, secret)
+      expect(result).toEqual({ ok: false, reason: 'expired' })
+    })
+
+    it('rejects payload when timestamp is in the future (newer than default 5 mins)', () => {
+      const payload = '{"event":"bond.created","timestamp":"2026-06-25T12:05:01.000Z","data":{}}' // 5m 1s in future
+      const sig = sign(payload, secret)
+      const result = verifySignature(sig, payload, secret)
+      expect(result).toEqual({ ok: false, reason: 'expired' })
+    })
+
+    it('accepts payload when timestamp is exactly at the limit of 5 mins past', () => {
+      const payload = '{"event":"bond.created","timestamp":"2026-06-25T11:55:00.000Z","data":{}}' // exactly 5 mins ago
+      const sig = sign(payload, secret)
+      const result = verifySignature(sig, payload, secret)
+      expect(result).toEqual({ ok: true })
+    })
+
+    it('accepts payload when timestamp is exactly at the limit of 5 mins future', () => {
+      const payload = '{"event":"bond.created","timestamp":"2026-06-25T12:05:00.000Z","data":{}}' // exactly 5 mins future
+      const sig = sign(payload, secret)
+      const result = verifySignature(sig, payload, secret)
+      expect(result).toEqual({ ok: true })
+    })
+
+    it('rejects payload when timestamp is outside custom tolerance window', () => {
+      const payload = '{"event":"bond.created","timestamp":"2026-06-25T11:58:59.000Z","data":{}}' // 1m 1s ago
+      const sig = sign(payload, secret)
+      const result = verifySignature(sig, payload, secret, undefined, { tolerance: 60000 }) // 1 min tolerance
+      expect(result).toEqual({ ok: false, reason: 'expired' })
+    })
+
+    it('accepts payload when timestamp is within custom tolerance window', () => {
+      const payload = '{"event":"bond.created","timestamp":"2026-06-25T11:59:01.000Z","data":{}}' // 59s ago
+      const sig = sign(payload, secret)
+      const result = verifySignature(sig, payload, secret, undefined, { tolerance: 60000 }) // 1 min tolerance
+      expect(result).toEqual({ ok: true })
+    })
   })
 })
