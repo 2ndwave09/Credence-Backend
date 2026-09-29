@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterEach } from 'vitest'
+import { describe, it, expect, beforeAll, afterEach, vi } from 'vitest'
 import { newDb } from 'pg-mem'
 import type { IMemoryDb } from 'pg-mem'
 import { Pool } from 'pg'
@@ -247,6 +247,103 @@ describe('SettlementsRepository', () => {
     })
   })
 
+  describe('boundary and recovery scenarios', () => {
+    it('rejects upsert when amount is negative (DB CHECK constraint)', async () => {
+      await expect(
+        repo.upsert({
+          bondId: bondId as unknown as number,
+          amount: '-1',
+          transactionHash: 'tx_negative_001',
+        }),
+      ).rejects.toThrow()
+
+      const count = await repo.countByBondId(bondId as unknown as number)
+      expect(count).toBe(0)
+    })
+
+    it('accepts zero amount at the lower boundary', async () => {
+      const result = await repo.upsert({
+        bondId: bondId as unknown as number,
+        amount: '0',
+        transactionHash: 'tx_zero_001',
+      })
+
+      expect(result.isDuplicate).toBe(false)
+      expect(String(result.settlement.amount)).toBe('0')
+    })
+
+    it('rejects upsert when status is not in the allowed set', async () => {
+      await expect(
+        repo.upsert({
+          bondId: bondId as unknown as number,
+          amount: '100',
+          transactionHash: 'tx_bad_status_001',
+          status: 'unknown' as never,
+        }),
+      ).rejects.toThrow()
+
+      const count = await repo.countByBondId(bondId as unknown as number)
+      expect(count).toBe(0)
+    })
+
+    it('rejects upsert when bond_id does not exist (FK violation)', async () => {
+      await expect(
+        repo.upsert({
+          bondId: 999999999 as unknown as number,
+          amount: '100',
+          transactionHash: 'tx_bad_bond_001',
+        }),
+      ).rejects.toThrow()
+    })
+
+    it('recovers after a failed upsert and succeeds on retry with valid input', async () => {
+      await expect(
+        repo.upsert({
+          bondId: bondId as unknown as number,
+          amount: '-5',
+          transactionHash: 'tx_recover_001',
+        }),
+      ).rejects.toThrow()
+
+      const retry = await repo.upsert({
+        bondId: bondId as unknown as number,
+        amount: '5',
+        transactionHash: 'tx_recover_001',
+      })
+
+      expect(retry.isDuplicate).toBe(false)
+      expect(retry.settlement.transactionHash).toBe('tx_recover_001')
+      expect(String(retry.settlement.amount)).toBe('5')
+    })
+
+    it('propagates a transient query failure and succeeds on retry', async () => {
+      const original = (pool as unknown as { query: (...args: unknown[]) => Promise<unknown> }).query
+      const spy = vi
+        .spyOn(pool as unknown as { query: (...args: unknown[]) => Promise<unknown> }, 'query')
+        .mockImplementationOnce(() => {
+          throw new Error('transient connection failure')
+        })
+
+      await expect(
+        repo.upsert({
+          bondId: bondId as unknown as number,
+          amount: '100',
+          transactionHash: 'tx_transient_001',
+        }),
+      ).rejects.toThrow('transient connection failure')
+
+      spy.mockRestore()
+      ;(pool as unknown as { query: (...args: unknown[]) => Promise<unknown> }).query = original
+
+      const retry = await repo.upsert({
+        bondId: bondId as unknown as number,
+        amount: '100',
+        transactionHash: 'tx_transient_001',
+      })
+      expect(retry.isDuplicate).toBe(false)
+    })
+  })
+
   describe('findById()', () => {
     it('returns the settlement when found', async () => {
       const { settlement } = await repo.upsert({
@@ -263,6 +360,11 @@ describe('SettlementsRepository', () => {
 
     it('returns null for unknown id', async () => {
       const found = await repo.findById(999999)
+      expect(found).toBeNull()
+    })
+
+    it('returns null for a non-numeric id boundary (0)', async () => {
+      const found = await repo.findById(0)
       expect(found).toBeNull()
     })
   })
@@ -289,6 +391,11 @@ describe('SettlementsRepository', () => {
       const results = await repo.findByBondId(unusedBondId as unknown as number)
       expect(results).toEqual([])
     })
+
+    it('returns empty array for a non-existent bond id', async () => {
+      const results = await repo.findByBondId(999999999 as unknown as number)
+      expect(results).toEqual([])
+    })
   })
 
   describe('findByTransactionHash()', () => {
@@ -306,6 +413,11 @@ describe('SettlementsRepository', () => {
 
     it('returns null for an unknown hash', async () => {
       const found = await repo.findByTransactionHash('tx_nonexistent')
+      expect(found).toBeNull()
+    })
+
+    it('returns null for an empty transaction hash', async () => {
+      const found = await repo.findByTransactionHash('')
       expect(found).toBeNull()
     })
   })
@@ -332,6 +444,11 @@ describe('SettlementsRepository', () => {
       const count = await repo.countByBondId(unusedBondId as unknown as number)
       expect(count).toBe(0)
     })
+
+    it('returns zero for a non-existent bond id', async () => {
+      const count = await repo.countByBondId(999999999 as unknown as number)
+      expect(count).toBe(0)
+    })
   })
 
   describe('delete()', () => {
@@ -350,6 +467,17 @@ describe('SettlementsRepository', () => {
     it('returns false for a non-existent id', async () => {
       const deleted = await repo.delete(999999)
       expect(deleted).toBe(false)
+    })
+
+    it('returns false when deleting the same id twice (idempotent recovery)', async () => {
+      const { settlement } = await repo.upsert({
+        bondId: bondId as unknown as number,
+        amount: '100',
+        transactionHash: 'tx_del_twice_001',
+      })
+
+      expect(await repo.delete(settlement.id)).toBe(true)
+      expect(await repo.delete(settlement.id)).toBe(false)
     })
   })
 
@@ -463,6 +591,27 @@ describe('SettlementsRepository', () => {
       })
       expect(third.isDuplicate).toBe(true)
     })
+
+    it('keeps the original bond_id and created_at stable across repeated duplicate upserts', async () => {
+      const first = await repo.upsert({
+        bondId: bondId as unknown as number,
+        amount: '100',
+        transactionHash: 'tx_stable_001',
+      })
+
+      const second = await repo.upsert({
+        bondId: unusedBondId as unknown as number,
+        amount: '999',
+        transactionHash: 'tx_stable_001',
+      })
+
+      expect(second.isDuplicate).toBe(true)
+      expect(second.settlement.id).toBe(first.settlement.id)
+      expect(second.settlement.bondId).toBe(String(bondId))
+      expect(second.settlement.createdAt.toISOString()).toBe(
+        first.settlement.createdAt.toISOString(),
+      )
+    })
   })
 })
 
@@ -475,6 +624,15 @@ describe('SettlementsRepository – rowCount nullish coalescing', () => {
 
   it('delete() returns false when rowCount is null', async () => {
     const repo = new SettlementsRepository(makeNullRowCountPool())
+    const result = await repo.delete(1)
+    expect(result).toBe(false)
+  })
+
+  it('delete() returns false when rowCount is undefined', async () => {
+    const pool = {
+      query: async () => ({ rows: [], rowCount: undefined }),
+    } as unknown as Pool
+    const repo = new SettlementsRepository(pool)
     const result = await repo.delete(1)
     expect(result).toBe(false)
   })
