@@ -12,35 +12,20 @@ import { sanitizeErrorMessage } from './errorSanitizer.js'
 /** Upper bound on the exponential backoff delay between retry attempts. */
 const MAX_BACKOFF_SECONDS = 3600
 
-/** Maximum number of events a single claim call may request. */
-const MAX_CLAIM_LIMIT = 1000
+/** Hard upper bound on rows returned by a single claim/fetch call. */
+const MAX_CLAIM_LIMIT = 10_000
 
-/** Maximum lease duration (seconds) accepted by claim/renew operations. */
+/** Hard upper bound on lease duration (seconds) to prevent effectively-infinite leases. */
 const MAX_LEASE_SECONDS = 86_400
 
-/** Maximum page size accepted by listQuarantine. */
-const MAX_QUARANTINE_PAGE_SIZE = 500
-
-/** Maximum page size accepted by getByAggregate. */
-const MAX_AGGREGATE_PAGE_SIZE = 1000
-
 /**
- * Validate an integer bound. Rejects non-finite, non-integer, or out-of-range
- * values so callers cannot silently pass NaN/Infinity into SQL parameters.
+ * Validate a positive integer bound. Rejects NaN, Infinity, non-integers,
+ * and values outside [min, max] so callers cannot silently pass unsafe
+ * values (e.g. negative limits that would disable LIMIT semantics).
  */
-function requireIntInRange(value: number, name: string, min: number, max: number): void {
-  if (!Number.isFinite(value) || !Number.isInteger(value)) {
-    throw new RangeError(`${name} must be a finite integer`)
-  }
-  if (value < min || value > max) {
-    throw new RangeError(`${name} must be between ${min} and ${max}`)
-  }
-}
-
-/** Validate a non-empty string identifier used in SQL predicates. */
-function requireNonEmptyString(value: string, name: string): void {
-  if (typeof value !== 'string' || value.length === 0) {
-    throw new TypeError(`${name} must be a non-empty string`)
+function assertBoundedInt(value: number, name: string, min: number, max: number): void {
+  if (!Number.isInteger(value) || value < min || value > max) {
+    throw new RangeError(`${name} must be an integer in [${min}, ${max}], received ${value}`)
   }
 }
 
