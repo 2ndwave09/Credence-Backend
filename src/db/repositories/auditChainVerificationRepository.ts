@@ -17,45 +17,97 @@ type StatusRow = {
   rows_checked: number
 }
 
-const MAX_SAFE_HEIGHT = Number.MAX_SAFE_INTEGER
+const MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER
 
-function assertSafeInteger(value: number, field: string): number {
-  if (!Number.isInteger(value) || value < 0 || value > MAX_SAFE_HEIGHT) {
-    throw new Error(`Invalid ${fiel}: ${value}`)
+function toSafeInteger(value: unknown, field: string): number {
+  if (value === null || value === undefined) {
+    throw new Error(`Invalid ${field}: value is required`)
   }
-  return value
+  const numeric = typeof value === 'number' ? value : Number(value)
+  if (!Number.isSafeInteger(numeric)) {
+    throw new Error(`Invalid ${field}: expected a safe integer`)
+  }
+  return numeric
+}
+
+function toSafeIntegerOrNull(value: unknown, field: string): number | null {
+  if (value === null || value === undefined) {
+    return null
+  }
+  return toSafeInteger(value, field)
+}
+
+function normalizeVerifiedAt(value: Date | string | null): string | null {
+  if (value === null || value === undefined) {
+    return null
+  }
+  if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) {
+      throw new Error('Invalid verifiedAt: invalid Date')
+    }
+    return value.toISOString()
+  }
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime())) {
+    throw new Error('Invalid verifiedAt: unparseable timestamp')
+  }
+  return parsed.toISOString()
 }
 
 function mapRow(row: StatusRow): AuditChainVerificationState {
-  const lastVerifiedHeight = Number(row.last_verified_height)
-  if (!Number.isSafeInteger(lastVerifiedHeight) || lastVerifiedHeight < 0) {
-    throw new Error(`Invalid last_verified_height returned from database`)
+  return {
+    lastVerifiedHeight: toSafeInteger(row.last_verified_height, 'last_verified_height'),
+    verifiedAt: normalizeVerifiedAt(row.verified_at),
+    status: row.status as AuditChainVerificationState['status'],
+    firstBreakSeq: toSafeIntegerOrNull(row.first_break_seq, 'first_break_seq'),
+    violationCount: toSafeInteger(row.violation_count, 'violation_count'),
+    rowsChecked: toSafeInteger(rows.rows_checked, 'rows_checked'),
+  }
+}
+
+function validateState(state: AuditChainVerificationState): AuditChainVerificationState {
+  if (!state || typeof state !== 'object') {
+    throw new Error('Invalid audit chain verification state')
   }
 
-  const firstBreakSeq =
-    row.first_break_seq !== null ? Number(row.first_break_seq) : null
-  if (firstBreakSeq !== null && (!Number.isSafeInteger(firstBreakSeq) || firstBreakSeq < 0)) {
-    throw new Error('Invalid first_break_seq returned from database')
+  const lastVerifiedHeight = toSafeInteger(state.lastVerifiedHeight, 'lastVerifiedHeight')
+  if (lastVerifiedHeight < 0) {
+    throw new Error('Invalid lastVerifiedHeight: must be non-negative')
   }
 
-  const violationCount = Number(row.violation_count)
-  if (!Number.isSafeInteger(violationCount) || violationCount < 0) {
-    throw new Error('Invalid violation_count returned from database')
+  const violationCount = toSafeInteger(state.violationCount ?? 0, 'violationCount')
+  if (violationCount < 0) {
+    throw new Error('Invalid violationCount: must be non-negative')
   }
 
-  const rowsChecked = Number(row.rows_checked)
-  if (!Number.isSafeInteger(rowsChecked) || rowsChecked < 0) {
-    throw new Error('Invalid rows_checked returned from database')
+  const rowsChecked = toSafeInteger(state.rowsChecked ?? 0, 'rowsChecked')
+  if (rowsChecked < 0) {
+    throw new Error('Invalid rowsChecked: must be non-negative')
+  }
+
+  const firstBreakSeq = toSafeIntegerOrNull(state.firstBreakSeq ?? null, 'firstBreakSeq')
+  if (firstBreakSeq !== null && firstBreakSeq < 0) {
+    throw new Error('Invalid firstBreakSeq: must be non-negative')
+  }
+
+  const verifiedAt = normalizeVerifiedAt(state.verifiedAt)
+
+  if (state.status === 'violation' && firstBreakSeq === null) {
+    throw new Error('Invalid state: violation status requires firstBreakSeq')
+  }
+
+  if (state.status === 'violation' && violationCount < 1) {
+    throw new Error('Invalid state: violation status requires violationCount >= 1')
+  }
+
+  if (state.status === 'never_run' && verifiedAt !== null) {
+    throw new Error('Invalid state: never_run cannot have a verifiedAt timestamp')
   }
 
   return {
     lastVerifiedHeight,
-    verifiedAt: row.verified_at
-      ? row.verified_at instanceof Date
-        ? row.verified_at.toISOString()
-        : String(row.verified_at)
-      : null,
-    status: row.status as AuditChainVerificationState['status'],
+    verifiedAt,
+    status: state.status,
     firstBreakSeq,
     violationCount,
     rowsChecked,
@@ -63,55 +115,22 @@ function mapRow(row: StatusRow): AuditChainVerificationState {
 }
 
 function cloneState(state: AuditChainVerificationState): AuditChainVerificationState {
-  return {
-    lastVerifiedHeight: state.lastVerifiedHeight,
-    verifiedAt: state.verifiedAt,
-    status: state.status,
-    firstBreakSeq: state.firstBreakSeq,
-    violationCount: state.violationCount,
-    rowsChecked: state.rowsChecked,
-  }
-}
-
-function validateState(state: AuditChainVerificationState): void {
-  if (!state || typeof state !== 'object') {
-    throw new Error('Invalid audit chain verification state')
-  }
-
-  assertSafeInteger(state.lastVerifiedHeight, 'lastVerifiedHeight')
-
-  if (state.firstBreakSeq !== null && state.firstBreakSeq !== undefined) {
-    assertSafeInteger(state.firstBreakSeq, 'firstBreakSeq')
-  }
-
-  if (state.violationCount !== undefined) {
-    assertSafeInteger(state.violationCount, 'violationCount')
-  }
-
-  if (state.rowsChecked !== undefined) {
-    assertSafeInteger(state.rowsChecked, 'rowsChecked')
-  }
-
-  if (state.verifiedAt !== null && state.verifiedAt !== undefined) {
-    const parsed = new Date(state.verifiedAt)
-    if (Number.isNaN(parsed.getTime())) {
-      throw new Error(`Invalid verifiedAt: ${state.verifiedAt}`)
-    }
-  }
-
-  if (state.status !== 'never_run' && state.verifiedAt === null) {
-    throw new Error('verifiedAt is required unless status is never_run')
-  }
+  return { ...state }
 }
 
 export class PostgresAuditChainVerificationRepository implements AuditChainVerificationRepository {
   constructor(private readonly db: Queryable) {}
 
-  async getStatus(): Promise<AuditChainVerificationState | null> {
+  private requireTenantId(): string {
     const tenantId = getTenantId()
     if (!tenantId) {
       throw new Error('Missing tenant context')
     }
+    return tenantId
+  }
+
+  async getStatus(): Promise<AuditChainVerificationState | null> {
+    const tenantId = this.requireTenantId()
     const result = await this.db.query<StatusRow>(
       `
       SELECT
@@ -136,11 +155,9 @@ export class PostgresAuditChainVerificationRepository implements AuditChainVerif
   }
 
   async saveStatus(state: AuditChainVerificationState): Promise<AuditChainVerificationState> {
-    const tenantId = getTenantId()
-    if (!tenantId) {
-      throw new Error('Missing tenant context')
-    }
-    validateState(state)
+    const tenantId = this.requireTenantId()
+    const normalized = validateState(state)
+
     const result = await this.db.query<StatusRow>(
       `
       INSERT INTO audit_chain_verification_status (
@@ -171,23 +188,24 @@ export class PostgresAuditChainVerificationRepository implements AuditChainVerif
       `,
       [
         tenantId,
-        state.lastVerifiedHeight,
-        state.verifiedAt,
-        state.status,
-        state.firstBreakSeq ?? null,
-        state.violationCount ?? 0,
-        state.rowsChecked ?? 0,
+        normalized.lastVerifiedHeight,
+        normalized.verifiedAt,
+        normalized.status,
+        normalized.firstBreakSeq,
+        normalized.violationCount,
+        normalized.rowsChecked,
       ],
     )
+
+    if (!result.rows || result.rows.length === 0) {
+      throw new Error('Failed to persist audit chain verification status')
+    }
 
     return mapRow(result.rows[0])
   }
 
   async clear(): Promise<void> {
-    const tenantId = getTenantId()
-    if (!tenantId) {
-      throw new Error('Missing tenant context')
-    }
+    const tenantId = this.requireTenantId()
     await this.db.query(
       `
       UPDATE audit_chain_verification_status
@@ -209,31 +227,29 @@ export class PostgresAuditChainVerificationRepository implements AuditChainVerif
 export class InMemoryAuditChainVerificationRepository implements AuditChainVerificationRepository {
   private readonly states = new Map<string, AuditChainVerificationState>()
 
-  async getStatus(): Promise<AuditChainVerificationState | null> {
+  private requireTenantId(): string {
     const tenantId = getTenantId()
     if (!tenantId) {
       throw new Error('Missing tenant context')
     }
+    return tenantId
+  }
+
+  async getStatus(): Promise<AuditChainVerificationState | null> {
+    const tenantId = this.requireTenantId()
     const state = this.states.get(tenantId)
     return state ? cloneState(state) : null
   }
 
-  async saveState(state: AuditChainVerificationState): Promise<AuditChainVerificationState> {
-    const tenantId = getTenantId()
-    if (!tenantId) {
-      throw new Error('Missing tenant context')
-    }
-    validateState(state)
-    const cloned = cloneState(state)
-    this.states.set(tenantId, cloned)
-    return cloneState(cloned)
+  async saveStatus(state: AuditChainVerificationState): Promise<AuditChainVerificationState> {
+    const tenantId = this.requireTenantId()
+    const normalized = validateState(state)
+    this.states.set(tenantId, cloneState(normalized))
+    return cloneState(normalized)
   }
 
   async clear(): Promise<void> {
-    const tenantId = getTenantId()
-    if (!tenantId) {
-      throw new Error('Missing tenant context')
-    }
+    const tenantId = this.requireTenantId()
     this.states.delete(tenantId)
   }
 }
