@@ -12,54 +12,36 @@ import { sanitizeErrorMessage } from './errorSanitizer.js'
 /** Upper bound on the exponential backoff delay between retry attempts. */
 const MAX_BACKOFF_SECONDS = 3600
 
-/**
- * Hard upper bound on rows returned by any single query in this repository.
- * Prevents accidental unbounded scans from callers passing Infinity/NaN/negative
- * limits, which would otherwise be forwarded verbatim to the database.
- */
-const MAX_QUERY_LIMIT = 10_000
+/** Maximum number of events a single claim call may request. */
+const MAX_CLAIM_LIMIT = 1000
+
+/** Maximum lease duration (seconds) accepted by claim/renew operations. */
+const MAX_LEASE_SECONDS = 86_400
+
+/** Maximum page size accepted by listQuarantine. */
+const MAX_QUARANTINE_PAGE_SIZE = 500
+
+/** Maximum page size accepted by getByAggregate. */
+const MAX_AGGREGATE_PAGE_SIZE = 1000
 
 /**
- * Normalize a caller-supplied row limit into a safe integer in [1, MAX_QUERY_LIMIT].
- * Boundary behavior:
- *  - undefined / null / NaN / Infinity / negative / 0  -> fallback (default 100)
- *  - fractional values are floored
- *  - values above MAX_QUERY_LIMIT are clamped
+ * Validate an integer bound. Rejects non-finite, non-integer, or out-of-range
+ * values so callers cannot silently pass NaN/Infinity into SQL parameters.
  */
-function normalizeLimit(value: number | undefined | null, fallback: number = 100): number {
-  if (value === undefined || value === null) return fallback
-  if (typeof value !== 'number' || !Number.isFinite(value)) return fallback
-  const floored = Math.floor(value)
-  if (floored <= 0) return fallback
-  return Math.min(floored, MAX_QUERY_LIMIT)
+function requireIntInRange(value: number, name: string, min: number, max: number): void {
+  if (!Number.isFinite(value) || !Number.isInteger(value)) {
+    throw new RangeError(`${name} must be a finite integer`)
+  }
+  if (value < min || value > max) {
+    throw new RangeError(`${name} must be between ${min} and ${max}`)
+  }
 }
 
-/**
- * Normalize a lease duration in seconds into a safe positive integer.
- * Boundary behavior:
- *  - undefined / null / NaN / Infinity / <= 0 -> fallback (default 300)
- *  - fractional values are floored
- *  - values above MAX_BACKOFF_SECONDS are clamped to avoid pathological leases
- */
-function normalizeLeaseSeconds(value: number | undefined | null, fallback: number = 300): number {
-  if (value === undefined || value === null) return fallback
-  if (typeof value !== 'number' || !Number.isFinite(value)) return fallback
-  const floored = Math.floor(value)
-  if (floored <= 0) return fallback
-  return Math.min(floored, MAX_BACKOFF_SECONDS)
-}
-
-/**
- * Normalize a pagination offset into a non-negative integer.
- * Boundary behavior:
- *  - undefined / null / NaN / Infinity / negative -> 0
- *  - fractional values are floored
- */
-function normalizeOffset(value: number | undefined | null): number {
-  if (value === undefined || value === null) return 0
-  if (typeof value !== 'number' || !Number.isFinite(value)) return 0
-  const floored = Math.floor(value)
-  return floored < 0 ? 0 : floored
+/** Validate a non-empty string identifier used in SQL predicates. */
+function requireNonEmptyString(value: string, name: string): void {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new TypeError(`${name} must be a non-empty string`)
+  }
 }
 
 type OutboxEventRow = {
