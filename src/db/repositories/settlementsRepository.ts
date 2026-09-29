@@ -1,1 +1,232 @@
-aW1wb3J0IHR5cGUgeyBQb29sIH0gZnJvbSAncGcnCmltcG9ydCB0eXBlIHsgUXVlcnlhYmxlIH0gZnJvbSAnLi9xdWVyeWFibGUuanMnCmltcG9ydCB7IFRyYW5zYWN0aW9uTWFuYWdlciB9IGZyb20gJy4uL3RyYW5zYWN0aW9uLmpzJwoKZXhwb3J0IHR5cGUgU2V0dGxlbWVudFN0YXR1cyA9ICdwZW5kaW5nJyB8ICdzZXR0bGVkJyB8ICdmYWlsZWQnCgpleHBvcnQgaW50ZXJmYWNlIFNldHRsZW1lbnQgewogIGlkOiBzdHJpbmcKICBib25kSWQ6IHN0cmluZwogIGFtb3VudDogc3RyaW5nCiAgdHJhbnNhY3Rpb25IYXNoOiBzdHJpbmcKICBzZXR0bGVkQXQ6IERhdGUKICBzdGF0dXM6IFNldHRsZW1lbnRTdGF0dXMKICBjcmVhdGVkQXQ6IERhdGUKICB1cGRhdGVkQXQ6IERhdGUKfQoKZXhwb3J0IGludGVyZmFjZSBDcmVhdGVTZXR0bGVtZW50SW5wdXQgewogIGJvbmRJZDogc3RyaW5nIHwgbnVtYmVyCiAgYW1vdW50OiBzdHJpbmcKICB0cmFuc2FjdGlvbkhhc2g6IHN0cmluZwogIHNldHRsZWRBdD86IERhdGUKICBzdGF0dXM/OiBTZXR0bGVtZW50U3RhdHVzCn0KCmV4cG9ydCBpbnRlcmZhY2UgVXBzZXJ0U2V0dGxlbWVudFJlc3VsdCB7CiAgc2V0dGxlbWVudDogU2V0dGxlbWVudAogIGlzRHVwbGljYXRlOiBib29sZWFuCn0KCnR5cGUgU2V0dGxlbWVudFJvdyA9IHsKICBpZDogc3RyaW5nIHwgbnVtYmVyCiAgYm9uZF9pZDogc3RyaW5nIHwgbnVtYmVyCiAgYW1vdW50OiBzdHJpbmcKICB0cmFuc2FjdGlvbl9oYXNoOiBzdHJpbmcKICBzZXR0bGVkX2F0OiBEYXRlIHwgc3RyaW5nCiAgc3RhdHVzOiBTZXR0bGVtZW50U3RhdHVzCiAgY3JlYXRlZF9hdDogRGF0ZSB8IHN0cmluZwogIHVwZGF0ZWRfYXQ6IERhdGUgfCBzdHJpbmcKICBpc19kdXBsaWNhdGU/OiBib29sZWFuCn0KCmV4cG9ydCBjb25zdCBTRVRUTEVNRU5UX1NUQVRVU0VTOiByZWFkb25seSBTZXR0bGVtZW50U3RhdHVzW10gPSBbJ3BlbmRpbmcnLCAnc2V0dGxlZCcsICdmYWlsZWQnXQoKY29uc3QgU1RBVFVTX1NFVDogUmVhZFNldDxTZXR0bGVtZW50U3RhdHVzPiA9IG5ldyBTZXQoU0VUVExFTUVOVF9TVEFUVVNFUykKCi8qKgogKiBUaGUgbWF4aW11bSBsZW5ndGggb2YgYSB0cmFuc2FjdGlvbiBoYXNoIHRoYXQgd2UgYWNjZXB0LiBUaGlzIG1hdGNoZXMgdGhlCiAqIGRhdGFiYXNlIGNvbHVtbiBjb25zdHJhaW50IGFuZCBwcmV2ZW50cyBvdmVyc2l6ZWQgaW5wdXRzIGZyb20gcmVhY2hpbmcgdGhlCiAqIGRyaXZlciAoYW5kIGZyb20gYmVpbmcgZWNob2VkIGJhY2sgaW4gZXJyb3IgbWVzc2FnZXMpLgogKi8KY29uc3QgTUFYX1RSQU5TQUNUSU9OX0hBU0hfTEVOR1RIID0gMjU1CgpleHBvcnQgY2xhc3MgU2V0dGxlbWVudFZhbGlkYXRpb25FcnJvciBleHRlbmRzIEVycm9yIHsKICBjb25zdHJ1Y3RvcihtZXNzYWdlOiBzdHJpbmcpIHsKICAgIHN1cGVyKG1lc3NhZ2UpCiAgICB0aGlzLm5hbWUgPSAnU2V0dGxlbWVudFZhbGlkYXRpb25FcnJvcicKICB9Cn0KCmV4cG9ydCBjbGFzcyBTZXR0bGVtZW50QmF0Y2hFcnJvciBleHRlbmRzIEVycm9yIHsKICBjb25zdHJ1Y3RvcigKICAgIG1lc3NhZ2U6IHN0cmluZywKICAgIHJlYWRvbmx5IGluZGV4OiBudW1iZXIsCiAgICByZWFkb25seSBjYXVzZTogdW5rbm93biwKICApIHsKICAgIHN1cGVyKG1lc3NhZ2UpCiAgICB0aGlzLm5hbWUgPSAnU2V0dGxlbWVudEJhdGNoRXJyb3InCiAgfQp9Cgpjb25zdCB0b0RhdGUgPSAodmFsdWU6IERhdGUgfCBzdHJpbmcpOiBEYXRlID0+CiAgdmFsdWUgaW5zdGFuY2VvZiBEYXRlID8gdmFsdWUgOiBuZXcgRGF0ZSh2YWx1ZSkKCmNvbnN0IG1hcFNldHRsZW1lbnQgPSAocm93OiBTZXR0bGVtZW50Um93KTogU2V0dGxlbWVudCA9PiAoewogIGlkOiBTdHJpbmcocm93LmlkKSwKICBib25kSWQ6IFN0cmluZyhyb3cuYm9uZF9pZCksCiAgYW1vdW50OiByb3cuYW1vdW50LAogIHRyYW5zYWN0aW9uSGFzaDogcm93LnRyYW5zYWN0aW9uX2hhc2gsCiAgc2V0dGxlZEF0OiB0b0RhdGUocm93LnNldHRsZWRfYXQpLAogIHN0YXR1czogcm93LnN0YXR1cywKICBjcmVhdGVkQXQ6IHRvRGF0ZShyb3cuY3JlYXRlZF9hdCksCiAgdXBkYXRlZEF0OiB0b0RhdGUocm93LnVwZGF0ZWRfYXQpLAp9KQoKLyoqCiAqIFZhbGlkYXRlIGFuZCBub3JtYWxpemUgYSBzaW5nbGUgc2V0dGxlbWVudCBpbnB1dC4KICoKICogSW52YXJpYW50czogdGhlIHJldHVybmVkIG9iamVjdCBpcyBhbHdheXMgc2FmZSB0byBiaW5kIGFzIHBhcmFtZXRlcnMgYW5kCiAqIG5ldmVyIGNvbnRhaW5zIGEgdmFsdWUgdGhhdCB3b3VsZCB2aW9sYXRlIGEgZGF0YWJhc2UgY29uc3RyYWludCBpbiBhIHdheQogKiB0aGF0IHdvdWxkIGJlIGluZGlzdGluZ3Vpc2hhYmxlIGZyb20gYSB0cmFuc2llbnQgZmFpbHVyZS4gVGhpcyBpcyB0aGUKICogc2luZ2xlIHBsYWNlIHdoZXJlIGludmFsaWQgaW5wdXQgaXMgcmVqZWN0ZWQgYmVmb3JlIGFueSBJL08gaGFwcGVucy4KICovCmV4cG9ydCBmdW5jdGlvbiB2YWxpZGF0ZVNldHRsZW1lbnRJbnB1dChpbnB1dDogQ3JlYXRlU2V0dGxlbWVudElucHV0KTogQ3JlYXRlU2V0dGxlbWVudElucHV0IHsKICBpZiAoaW5wdXQgPT0gbnVsbCB8fCB0eXBlb2YgaW5wdXQgIT09ICdvYmplY3QnKSB7CiAgICB0aHJvdyBuZXcgU2V0dGxlbWVudFZhbGlkYXRpb25FcnJvcignc2V0dGxlbWVudCBpbnB1dCBtdXN0IGJlIGFuIG9iamVjdCcpCiAgfQoKICBjb25zdCB7IGJvbmRJZCwgYW1vdW50LCB0cmFuc2FjdGlvbkhhc2gsIHNldHRsZWRBdCwgc3RhdHVzIH0gPSBpbnB1dAoKICBpZiAoYm9uZElkID09PSB1bmRlZmluZWQgfHwgYm9uZElkID09PSBudWxsIHx8IGJvbmRJZCA9PT0gJycpIHsKICAgIHRocm93IG5ldyBTZXR0bGVtZW50VmFsaWRhdGlvbkVycm9yKCdib25kSWQgaXMgcmVxdWlyZWQnKQogIH0KCiAgaWYgKHR5cGVvZiBhbW91bnQgIT09ICdzdHJpbmcnIHx8IGFtb3VudC50cmltKCkgPT09ICcnKSB7CiAgICB0aHJvdyBuZXcgU2V0dGxlbWVudFZhbGlkYXRpb25FcnJvcignYW1vdW50IGlzIHJlcXVpcmVkJykKICB9CgogIGlmICghL15cZCsoXC5cZCspPyQvLnRlc3QoYW1vdW50KSkgewogICAgdGhyb3cgbmV3IFNldHRsZW1lbnRWYWxpZGF0aW9uRXJyb3IoJ2Ftb3VudCBtdXN0IGJlIGEgbm9uLW5lZ2F0aXZlIGRlY2ltYWwgc3RyaW5nJykKICB9CgogIGlmICh0eXBlb2YgdHJhbnNhY3Rpb25IYXNoICE9PSAnc3RyaW5nJyB8fCB0cmFuc2FjdGlvbkhhc2gudHJpbSgpID09PSAnJykgewogICAgdGhyb3cgbmV3IFNldHRsZW1lbnRWYWxpZGF0aW9uRXJyb3IoJ3RyYW5zYWN0aW9uSGFzaCBpcyByZXF1aXJlZCcpCiAgfQoKICBpZiAodHJhbnNhY3Rpb25IYXNoLmxlbmd0aCA+IE1BWF9UUkFOU0FDVElPTl9IQVNIX0xFTkdUSCkgewogICAgdGhyb3cgbmV3IFNldHRsZW1lbnRWYWxpZGF0aW9uRXJyb3IoCiAgICAgIGB0cmFuc2FjdGlvbkhhc2ggbXVzdCBiZSBhdCBtb3N0ICR7TUFYX1RSQU5TQUNUSU9OX0hBU0hfTEVOR1RIfSBjaGFyYWN0ZXJzYCwKICAgICkKICB9CgogIGlmIChzZXR0bGVkQXQgIT09IHVuZGVmaW5lZCAmJiAhKHNldHRsZWRBdCBpbnN0YW5jZW9mIERhdGUpKSB7CiAgICB0aHJvdyBuZXcgU2V0dGxlbWVudFZhbGlkYXRpb25FcnJvcignc2V0dGxlZEF0IG11c3QgYmUgYSBEYXRlJykKICB9CgogIGlmIChzZXR0bGVkQXQgIT09IHVuZGVmaW5lZCAmJiBOdW1iZXIuaXNOYU4oc2V0dGxlZEF0LmdldFRpbWUoKSkpIHsKICAgIHRocm93IG5ldyBTZXR0bGVtZW50VmFsaWRhdGlvbkVycm9yKCdzZXR0bGVkQXQgbXVzdCBiZSBhIHZhbGlkIERhdGUnKQogIH0KCiAgaWYgKHN0YXR1cyAhPT0gdW5kZWZpbmVkICYmICFTVEFUVVNfU0VULmhhcyhzdGF0dXMpKSB7CiAgICB0aHJvdyBuZXcgU2V0dGxlbWVudFZhbGlkYXRpb25FcnJvcigKICAgICAgYHN0YXR1cyBtdXN0IGJlIG9uZSBvZiAke1NFVFRMRU1FTlRfU1RBVFVTRVMuam9pbignLCAnKX1gLAogICAgKQogIH0KCiAgcmV0dXJuIHsKICAgIGJvbmRJZCwKICAgIGFtb3VudCwKICAgIHRyYW5zYWN0aW9uSGFzaCwKICAgIC4uLihzZXR0bGVkQXQgIT09IHVuZGVmaW5lZCA/IHsgc2V0dGxlZEF0IH0gOiB7fSksCiAgICAuLi4oc3RhdHVzICE9PSB1bmRlZmluZWQgPyB7IHN0YXR1cyB9IDoge30pLAogIH0KfQoKZXhwb3J0IGNsYXNzIFNldHRsZW1lbnRzUmVwb3NpdG9yeSB7CiAgcHJpdmF0ZSByZWFkb25seSB0eE1hbmFnZXI/OiBUcmFuc2FjdGlvbk1hbmFnZXIKCiAgLyoqCiAgICogQHBhcmFtIGRiICAgLSBBIGBRdWVyeWFibGVgIChQb29sIG9yIFBvb2xDbGllbnQpIGZvciByZWFkL3dyaXRlIHF1ZXJpZXMuCiAgICogQHBhcmFtIHBvb2wgLSBUaGUgdW5kZXJseWluZyBgUG9vbGA7IHJlcXVpcmVkIGZvciBgdXBzZXJ0QmF0Y2goKWAgd2hpY2gKICAgKiAgICAgICAgICAgICAgIG5lZWRzIGFuIGV4Y2x1c2l2ZSBjbGllbnQgYW5kIFRyYW5zYWN0aW9uTWFuYWdlciBob29rcy4KICAgKi8KICBjb25zdHJ1Y3Rvcihwcml2YXRlIHJlYWRvbmx5IGRiOiBRdWVyeWFibGUsIHByaXZhdGUgcmVhZG9ubHkgcG9vbD86IFBvb2wpIHsKICAgIGlmIChwb29sKSB7CiAgICAgIHRoaXMudHhNYW5hZ2VyID0gbmV3IFRyYW5zYWN0aW9uTWFuYWdlcihwb29sKQogICAgfQogIH0KCiAgYXN5bmMgdXBzZXJ0KGlucHV0OiBDcmVhdGVTZXR0bGVtZW50SW5wdXQpOiBQcm9taXNlPFVwc2VydFNldHRsZW1lbnRSZXN1bHQ+IHsKICAgIGNvbnN0IG5vcm1hbGl6ZWQgPSB2YWxpZGF0ZVNldHRsZW1lbnRJbnB1dChpbnB1dCkKICAgIHJldHVybiB0aGlzLl91cHNlcnQodGhpcy5kYiwgbm9ybWFsaXplZCkKICB9CgogIGFzeW5jIHVwc2VydEJhdGNoKGlucHV0czogQ3JlYXRlU2V0dGxlbWVudElucHV0W10pOiBQcm9taXNlPFVwc2VydFNldHRsZW1lbnRSZXN1bHRbXT4gewogICAgaWYgKCFBcnJheS5pc0FycmF5KGlucHV0cykpIHsKICAgICAgdGhyb3cgbmV3IFNldHRsZW1lbnRWYWxpZGF0aW9uRXJyb3IoJ3Vwc2VydEJhdGNoIGV4cGVjdHMgYW4gYXJyYXkgb2Ygc2V0dGxlbWVudCBpbnB1dHMnKQogICAgfQoKICAgIC8vIFZhbGlkYXRlIHRoZSBlbnRpcmUgYmF0Y2ggdXAgZnJvbnQgc28gYSBzaW5nbGUgaW52YWxpZCBlbnRyeSBjYW5ub3QKICAgIC8vIGxlYXZlIGEgcGFydGlhbGx5LWFwcGxpZWQgYmF0Y2ggYmVoaW5kLiBUaGlzIGlzIGEgZmFpbC1mYXN0IGd1YXJhbnRlZToKICAgIC8vIGVpdGhlciBldmVyeSBpbnB1dCBpcyB2YWxpZCBvciBub3RoaW5nIGlzIHdyaXR0ZW4uCiAgICBjb25zdCBub3JtYWxpemVkID0gaW5wdXRzLm1hcCgoaW5wdXQsIGluZGV4KSA9PiB7CiAgICAgIHRyeSB7CiAgICAgICAgcmV0dXJuIHZhbGlkYXRlU2V0dGxlbWVudElucHV0KGlucHV0KQogICAgICB9IGNhdGNoIChlcnJvcikgewogICAgICAgIHRocm93IG5ldyBTZXR0bGVtZW50QmF0Y2hFcnJvcigKICAgICAgICAgIGBpbnZhbGlkIHNldHRsZW1lbnQgaW5wdXQgYXQgaW5kZXggJHtpbmRleH06ICR7KGVycm9yIGFzIEVycm9yKS5tZXNzYWdlfWAsCiAgICAgICAgICBpbmRleCwKICAgICAgICAgIGVycm9yLAogICAgICAgICkKICAgICAgfQogICAgfSkKCiAgICAvLyBJZiBhIHBvb2wtYmFja2VkIFRyYW5zYWN0aW9uTWFuYWdlciBpcyBhdmFpbGFibGUsIHVzZSBpdCBzbyBwb3N0LWNvbW1pdAogICAgLy8gaG9va3MgKGNhY2hlIGludmFsaWRhdGlvbiwgbWV0cmljcykgZmlyZSBjb3JyZWN0bHkgYW5kIHJvbGxiYWNrIGhvb2tzCiAgICAvLyBjYW4gY29tcGVuc2F0ZSBvbiBwYXJ0aWFsIGZhaWx1cmUuIFRoaXMgYWxzbyBlbGltaW5hdGVzIHRoZSBtYW51YWwKICAgIC8vIEJFR0lOL0NPTU1JVCBwYXRoIHRoYXQgYnlwYXNzZWQgdGhlIGhvb2sgbWVjaGFuaXNtLgogICAgaWYgKHRoaXMudHhNYW5hZ2VyKSB7CiAgICAgIHJldHVybiB0aGlzLnR4TWFuYWdlci53aXRoVHJhbnNhY3Rpb24oYXN5bmMgKGNsaWVudCkgPT4gewogICAgICAgIGNvbnN0IHJlc3VsdHM6IFVwc2VydFNldHRsZW1lbnRSZXN1bHRbXSA9IFtdCiAgICAgICAgZm9yIChjb25zdCBpbnB1dCBvZiBub3JtYWxpemVkKSB7CiAgICAgICAgICBjb25zdCByZXMgPSBhd2FpdCB0aGlzLl91cHNlcnQoY2xpZW50LCBpbnB1dCkKICAgICAgICAgIHJlc3VsdHMucHVzaChyZXMpCiAgICAgICAgfQogICAgICAgIHJldHVybiByZXN1bHRzCiAgICAgIH0pCiAgICB9CgogICAgLy8gRmFsbGJhY2s6IG5vIHBvb2wgY29uZmlndXJlZCwgd29yayB3aXRoIHdoYXRldmVyIGRiIHdhcyBnaXZlbi4KICAgIC8vIElmIGRiIGlzIGl0c2VsZiBhIFBvb2xDbGllbnQgYWxyZWFkeSBpbnNpZGUgYSB0cmFuc2FjdGlvbiwgdGhpcyBpcwogICAgLy8gYSBuZXN0ZWQgY2FsbCB0aGF0IHNoYXJlcyB0aGUgb3V0ZXIgdHJhbnNhY3Rpb24g4oCUIGNvcnJlY3QuCiAgICAvLyBJZiBkYiBpcyBhIFBvb2wgd2l0aG91dCBUcmFuc2FjdGlvbk1hbmFnZXIsIHdlIGNhbm5vdCBndWFyYW50ZWUKICAgIC8vIGF0b21pY2l0eSBvZiB0aGUgYmF0Y2g7IGNhbGxlcnMgc2hvdWxkIHN1cHBseSBhIHBvb2wuCiAgICBjb25zdCByZXN1bHRzOiBVcHNlcnRTZXR0bGVtZW50UmVzdWx0W10gPSBbXQogICAgZm9yIChjb25zdCBpbnB1dCBvZiBub3JtYWxpemVkKSB7CiAgICAgIGNvbnN0IHJlcyA9IGF3YWl0IHRoaXMuX3Vwc2VydCh0aGlzLmRiLCBpbnB1dCkKICAgICAgcmVzdWx0cy5wdXNoKHJlcykKICAgIH0KICAgIHJldHVybiByZXN1bHRzCiAgfQoKICBwcml2YXRlIGFzeW5jIF91cHNlcnQoZGIG... (truncated)
+import type { Pool } from 'pg'
+import type { Queryable } from './queryable.js'
+import { TransactionManager } from '../transaction.js'
+
+export type SettlementStatus = 'pending' | 'settled' | 'failed'
+
+export interface Settlement {
+  id: string
+  bondId: string
+  amount: string
+  transactionHash: string
+  settledAt: Date
+  status: SettlementStatus
+  createdAt: Date
+  updatedAt: Date
+}
+
+export interface CreateSettlementInput {
+  bondId: string | number
+  amount: string
+  transactionHash: string
+  settledAt?: Date
+  status?: SettlementStatus
+}
+
+export interface UpsertSettlementResult {
+  settlement: Settlement
+  isDuplicate: boolean
+}
+
+type SettlementRow = {
+  id: string | number
+  bond_id: string | number
+  amount: string
+  transaction_hash: string
+  settled_at: Date | string
+  status: SettlementStatus
+  created_at: Date | string
+  updated_at: Date | string
+  is_duplicate?: boolean
+}
+
+const toDate = (value: Date | string): Date =>
+  value instanceof Date ? value : new Date(value)
+
+const mapSettlement = (row: SettlementRow): Settlement => ({
+  id: String(row.id),
+  bondId: String(row.bond_id),
+  amount: row.amount,
+  transactionHash: row.transaction_hash,
+  settledAt: toDate(row.settled_at),
+  status: row.status,
+  createdAt: toDate(row.created_at),
+  updatedAt: toDate(row.updated_at),
+})
+
+export class SettlementsRepository {
+  private readonly txManager?: TransactionManager
+
+  /**
+   * @param db   - A `Queryable` (Pool or PoolClient) for read/write queries.
+   * @param pool - The underlying `Pool`; required for `upsertBatch()` which
+   *               needs an exclusive client and TransactionManager hooks.
+   */
+  constructor(private readonly db: Queryable, private readonly pool?: Pool) {
+    if (pool) {
+      this.txManager = new TransactionManager(pool)
+    }
+  }
+
+  async upsert(input: CreateSettlementInput): Promise<UpsertSettlementResult> {
+    return this._upsert(this.db, input)
+  }
+
+  async upsertBatch(inputs: CreateSettlementInput[]): Promise<UpsertSettlementResult[]> {
+    // If a pool-backed TransactionManager is available, use it so post-commit
+    // hooks (cache invalidation, metrics) fire correctly and rollback hooks
+    // can compensate on partial failure. This also eliminates the manual
+    // BEGIN/COMMIT path that bypassed the hook mechanism.
+    if (this.txManager) {
+      return this.txManager.withTransaction(async (client) => {
+        const results: UpsertSettlementResult[] = []
+        for (const input of inputs) {
+          const res = await this._upsert(client, input)
+          results.push(res)
+        }
+        return results
+      })
+    }
+
+    // Fallback: no pool configured, work with whatever db was given.
+    // If db is itself a PoolClient already inside a transaction, this is
+    // a nested call that shares the outer transaction — correct.
+    // If db is a Pool without TransactionManager, we cannot guarantee
+    // atomicity of the batch; callers should supply a pool.
+    const results: UpsertSettlementResult[] = []
+    for (const input of inputs) {
+      const res = await this._upsert(this.db, input)
+      results.push(res)
+    }
+    return results
+  }
+
+  private async _upsert(db: Queryable, input: CreateSettlementInput): Promise<UpsertSettlementResult> {
+    const settledAt = input.settledAt ?? new Date()
+    const status = input.status ?? 'pending'
+
+    // Atomic upsert: use xmax to detect whether the row was freshly inserted
+    // (xmax = 0) or updated due to an ON CONFLICT hit (xmax > 0).
+    //
+    // The previous two-step SELECT + INSERT pattern was a TOCTOU race:
+    // between the SELECT and the INSERT a concurrent writer could insert the
+    // same transaction_hash, making both writers believe they are the first.
+    // This single-statement form eliminates that race entirely.
+    const result = await db.query<SettlementRow & { xmax: string }>(
+      `INSERT INTO settlements (bond_id, amount, transaction_hash, settled_at, status)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (transaction_hash)
+       DO UPDATE SET
+         amount     = EXCLUDED.amount,
+         status     = EXCLUDED.status,
+         settled_at = EXCLUDED.settled_at,
+         updated_at = NOW()
+       RETURNING id, bond_id, amount, transaction_hash, settled_at, status, created_at, updated_at,
+                 xmax::text AS xmax`,
+      [input.bondId, input.amount, input.transactionHash, settledAt, status],
+    )
+
+    // xmax = '0' → fresh insert (no prior conflict row); anything else → updated existing row.
+    const isDuplicate = result.rows[0].xmax !== '0'
+
+    return { settlement: mapSettlement(result.rows[0]), isDuplicate }
+  }
+
+  async findById(id: string | number): Promise<Settlement | null> {
+    const result = await this.db.query<SettlementRow>(
+      `
+      SELECT id, bond_id, amount, transaction_hash, settled_at, status, created_at, updated_at
+      FROM settlements
+      WHERE id = $1
+      `,
+      [id]
+    )
+
+    return result.rows[0] ? mapSettlement(result.rows[0]) : null
+  }
+
+  async findByBondId(bondId: string | number): Promise<Settlement[]> {
+    const result = await this.db.query<SettlementRow>(
+      `
+      SELECT id, bond_id, amount, transaction_hash, settled_at, status, created_at, updated_at
+      FROM settlements
+      WHERE bond_id = $1
+      ORDER BY settled_at DESC, id DESC
+      `,
+      [bondId]
+    )
+
+    return result.rows.map(mapSettlement)
+  }
+
+  async findByTransactionHash(transactionHash: string): Promise<Settlement | null> {
+    const result = await this.db.query<SettlementRow>(
+      `
+      SELECT id, bond_id, amount, transaction_hash, settled_at, status, created_at, updated_at
+      FROM settlements
+      WHERE transaction_hash = $1
+      `,
+      [transactionHash]
+    )
+
+    return result.rows[0] ? mapSettlement(result.rows[0]) : null
+  }
+
+  async countByBondId(bondId: string | number): Promise<number> {
+    const result = await this.db.query<{ count: string }>(
+      `
+      SELECT COUNT(*)::TEXT AS count
+      FROM settlements
+      WHERE bond_id = $1
+      `,
+      [bondId]
+    )
+
+    return parseInt(result.rows[0]?.count ?? '0', 10)
+  }
+
+  async delete(id: string | number): Promise<boolean> {
+    const result = await this.db.query(
+      `
+      DELETE FROM settlements
+      WHERE id = $1
+      `,
+      [id]
+    )
+
+    return (result.rowCount ?? 0) > 0
+  }
+
+  async findManyPaginated(params: {
+    limit: number
+    cursor?: { t: string; i: string }
+    bondId?: string
+}): Promise<Settlement[]> {
+    const { limit, cursor, bondId } = params
+    const values: any[] = [limit]
+    let whereClause = ''
+    let paramIndex = 2
+
+    if (bondId) {
+      whereClause = `WHERE bond_id = $${paramIndex++}`
+      values.push(bondId)
+    }
+
+    if (cursor) {
+      const prefix = whereClause ? 'AND' : 'WHERE'
+      whereClause += ` ${prefix} (settled_at, id) < ($${paramIndex}, $${paramIndex + 1})`
+      values.push(cursor.t, cursor.i)
+    }
+
+    const query = `
+      SELECT id, bond_id, amount, transaction_hash, settled_at, status, created_at, updated_at
+      FROM settlements
+      ${whereClause}
+      ORDER BY settled_at DESC, id DESC
+      LIMIT $1
+    `
+
+    const result = await this.db.query<SettlementRow>(query, values)
+    return result.rows.map(mapSettlement)
+  }
+}
