@@ -652,8 +652,6 @@ To prevent duplicate side-effects (e.g., duplicate webhooks or notifications) wh
 
 For details on configuration and usage, see **[docs/REPLAY_SAFE_HANDLERS.md](docs/REPLAY_SAFE_HANDLERS.md)**.
 - [Replay & Inspection Guide (Operator)](docs/replay_and_inspection.md)
-<<<<<<< HEAD
-=======
 - [Event Ordering Guarantees](docs/EVENT_ORDERING.md)
 
 
@@ -664,7 +662,6 @@ For observability, request tracing, metrics, and structured logging guidelines:
 - **Log Retention**: See [docs/LOG_RETENTION.md](docs/LOG_RETENTION.md) for how long each log type is kept and where.
 - **Request Tracing & Metrics**: See [docs/observability.md](docs/observability.md) for request tracing, PII redaction rules, and the `req.log` request-scoped logger.
 - **Correlation ID Middleware**: See `src/middleware/correlationId.ts` — every request receives an `X-Correlation-ID` (propagated or auto-generated) for distributed tracing across services.
->>>>>>> 4c068de46ec49205ba767ecdab4c902f7773d70a
 
 ## Security
 
