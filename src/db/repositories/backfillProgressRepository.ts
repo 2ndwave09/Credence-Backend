@@ -1,4 +1,4 @@
-import type { Pool, PoolClient } from 'pg'
+import type { Queryable } from './queryable.js'
 
 /**
  * Lifecycle status for a durable backfill progress marker.
@@ -53,7 +53,7 @@ const MAX_CURSOR_LENGTH = 1024
  * Provides durable checkpoint storage so backfills resume after process restarts.
  */
 export class BackfillProgressRepository {
-  constructor(private readonly db: Pool | PoolClient) {}
+  constructor(private readonly db: Queryable) {}
 
   private map(row: Record<string, unknown>): BackfillProgress {
     const metadata = row.metadata
