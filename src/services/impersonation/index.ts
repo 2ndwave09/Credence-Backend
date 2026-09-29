@@ -1,5 +1,5 @@
 import { randomBytes } from 'crypto'
-import { MOCK_USERS } from '../../middleware/auth.js'
+import { userRepo } from '../../repositories/userRepository.js'
 import { AuditLogService, AuditAction, auditLogService } from '../audit/index.js'
 import { pool } from '../../db/pool.js'
 import { ImpersonationTokenRepository } from '../../repositories/impersonationTokenRepository.js'
@@ -40,11 +40,12 @@ export class ImpersonationService {
     tenantId: string,
     request: IssueImpersonationTokenRequest,
     ipAddress?: string,
+    requestId?: string
   ): Promise<IssueImpersonationTokenResponse> {
     const { targetUserId, reason, ttlSeconds } = request
 
     if (!reason || reason.trim().length === 0) {
-      void this.auditLog.logAction(
+      await this.auditLog.logAction(
         tenantId,
         adminId,
         adminEmail,
@@ -55,13 +56,14 @@ export class ImpersonationService {
         'failure',
         'reason is required',
         ipAddress,
+        requestId
       )
       throw new Error('reason is required and must not be empty')
     }
 
-    const target = MOCK_USERS[targetUserId]
+    const target = userRepo.findById(targetUserId)
     if (!target) {
-      void this.auditLog.logAction(
+      await this.auditLog.logAction(
         tenantId,
         adminId,
         adminEmail,
@@ -72,6 +74,7 @@ export class ImpersonationService {
         'failure',
         'target user not found',
         ipAddress,
+        requestId
       )
       throw new Error(`User not found: ${targetUserId}`)
     }
@@ -95,7 +98,7 @@ export class ImpersonationService {
 
     await this.repo.create(record)
 
-    void this.auditLog.logAction(
+    await this.auditLog.logAction(
       tenantId,
       adminId,
       adminEmail,
@@ -112,6 +115,7 @@ export class ImpersonationService {
       'success',
       undefined,
       ipAddress,
+      requestId
     )
 
     return { tokenId, targetUserId, targetUserEmail: target.email, expiresAt: expiresAt.toISOString(), ttlSeconds: ttl }
@@ -126,6 +130,7 @@ export class ImpersonationService {
     tenantId: string,
     tokenId: string,
     ipAddress?: string,
+    requestId?: string
   ): Promise<void> {
     const record = await this.repo.findById(tokenId)
 
@@ -139,7 +144,7 @@ export class ImpersonationService {
 
     await this.repo.revoke(tokenId, adminId)
 
-    void this.auditLog.logAction(
+    await this.auditLog.logAction(
       tenantId,
       adminId,
       adminEmail,
@@ -154,6 +159,7 @@ export class ImpersonationService {
       'success',
       undefined,
       ipAddress,
+      requestId
     )
   }
 
