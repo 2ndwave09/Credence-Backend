@@ -1,6 +1,5 @@
-// @ts-nocheck
 /**
- * Boundary + recovery coverage for src/db/repositories/backfillProgressRepository.ts.
+ * Boundary + recovery coverage for src/db/outbox/repository.ts.
  *
  * Maps to issue #1364 acceptance criteria:
  * - deterministic for valid/invalid/duplicate/boundary inputs
@@ -8,7 +7,6 @@
  * - retries/partial failure/concurrent execution cannot corrupt state
  * - success/rejection/boundary/regression scenarios
  * - callers remain compatible (public method shapes unchanged)
- * - failures diagnosable without exposing sensitive data
  * - failures diagnosable without exposing sensitive data
  *
  * States covered: loading (find), error (invalid input / unknown job),
@@ -19,7 +17,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { newDb, type IMemoryDb } from 'pg-mem'
 import type { Pool } from 'pg'
 import crypto from 'crypto'
-import { BackfillProgressRepository } from './backfillProgressRepository.js'
+import { BackfillProgressRepository } from './repository.js'
 
 async function createPool(): Promise<{ db: IMemoryDb; pool: Pool }> {
   const db = newDb()
@@ -31,7 +29,7 @@ async function createPool(): Promise<{ db: IMemoryDb; pool: Pool }> {
   const pgMock = db.adapters.createPg()
   const pool = new pgMock.Pool() as unknown as Pool
   await pool.query(`
-    CREATE TABLE backfill_progress (
+    CREATE TABLE outbox (
       job_name        TEXT        PRIMARY KEY,
       cursor_value    TEXT        NOT NULL DEFAULT '',
       rows_processed  BIGINT      NOT NULL DEFAULT 0
@@ -48,7 +46,7 @@ async function createPool(): Promise<{ db: IMemoryDb; pool: Pool }> {
   return { db, pool }
 }
 
-describe('BackfillProgressRepository boundary + recovery', () => {
+describe('OutboxRepository boundary + recovery', () => {
   let pool: Pool
   let repo: BackfillProgressRepository
 
