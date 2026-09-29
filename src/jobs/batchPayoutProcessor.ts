@@ -60,8 +60,7 @@ export interface BatchPayoutOptions {
   logger?: (message: string) => void
   /**
    * Maximum number of items allowed in a single batch.
-   * Defaults to 1000. Prevents unbounded memory use and unreasonably
-   * large transactions from being submitted in one call.
+   * Defaults to 1000. Non-positive or non-finite values fall back to the default.
    */
   maxBatchSize?: number
 }
@@ -75,21 +74,14 @@ export interface BatchPayoutOptions {
  * (duplicate) items are skipped.
  *
  * Invariants:
- * - Validation happens up front before any side effects (atomic semantics).
- * - A given item is executed at most once per `process()` call.
- * - Duplicate transaction hashes within the same batch are detected and
- *   only the first occurrence is executed; later ones are skipped.
- * - Execution failures are persisted as `failed` (best effort) and are
- *   retry-eligible.
- * - Successful execution with a failed final upsert is retry-eligible.
- * - Concurrent ``process()`` calls are serialized per instance to avoid
- *   interleaved writes to the same transaction hash.
+ * - The entire payload is validated before any write or execution.
+ * - A duplicate transaction hash within the same batch is never executed twice.
+ * - A failure in one item never mutates the outcome of another item.
+ * - Every failed item is marked retry-eligible so no work is silently lost.
  */
 export class BatchPayoutProcessor {
   private readonly logger: (message: string) => void
   private readonly maxBatchSize: number
-  /** Serializes concurrent `process()` calls on this instance. */
-  private inProgress: Promise<BatchPayoutResult> | null = null
 
   constructor(
     private readonly store: PayoutSettlementStore,
@@ -97,11 +89,14 @@ export class BatchPayoutProcessor {
     options: BatchPayoutOptions = {},
   ) {
     this.logger = options.logger ?? (() => {})
-    const maxBatchSize = options.maxBatchSize ?? 1000
-    if (!Number.isInteger(maxBatchSize) || maxBatchSize < 1) {
-      throw new ValidationError('maxBatchSize must be a positive integer')
-    }
-    this.maxBatchSize = maxBatchSize
+    const configuredMax = options.maxBatchSize
+    this.maxBatchSize =
+      typeof configuredMax === 'number' &&
+      Number.isFinite(configuredMax) &&
+      Number.isInteger(configuredMax) &&
+      configuredMax > 0
+        ? configuredMax
+        : 1000
   }
 
   /**
@@ -114,9 +109,10 @@ export class BatchPayoutProcessor {
     }
     if (items.length > this.maxBatchSize) {
       throw new ValidationError(
-        `Batch payout payload exceeds maximum batch size of ${this.maxBatchSize} (counted ${items.length})`,
+        `Batch payout payload exceeds the maximum of ${this.maxBatchSize} items`,
       )
     }
+    const seenTransactionHashes = new Set<string>()
     for (let i = 0; i < items.length; i++) {
       const item = items[i]
       if (!item || typeof item !== 'object') {
@@ -143,6 +139,12 @@ export class BatchPayoutProcessor {
           `Item at index ${i} has invalid transactionHash: must be a string between 1 and 128 characters`,
         )
       }
+      if (seenTransactionHashes.has(item.transactionHash)) {
+        throw new ValidationError(
+          `Item at index ${i} has duplicate transactionHash ${item.transactionHash}`,
+        )
+      }
+      seenTransactionHashes.add(item.transactionHash)
       if (item.settledAt !== undefined && (!(item.settledAt instanceof Date) || isNaN(item.settledAt.getTime()))) {
         throw new ValidationError(`Item at index ${i} has invalid settledAt: must be a valid Date object`)
       }
@@ -150,21 +152,6 @@ export class BatchPayoutProcessor {
   }
 
   async process(items: PayoutItem[]): Promise<BatchPayoutResult> {
-    // Serialize concurrent calls on this instance so two batches cannot
-    // interleave writes for the same transaction hash.
-    if (this.inProgress) {
-      throw new ValidationError('BatchPayoutProcessor is already processing a batch; concurrent calls are not allowed')
-    }
-    const run = this.processInternal(items)
-    this.inProgress = run
-    try {
-      return await run
-    } finally {
-      this.inProgress = null
-    }
-  }
-
-  private async processInternal(items: PayoutItem[]): Promise<BatchPayoutResult> {
     this.validatePayload(items)
     const startTime = new Date().toISOString()
     const startMs = Date.now()
@@ -174,25 +161,7 @@ export class BatchPayoutProcessor {
     let failed = 0
     let skipped = 0
 
-    // Deduplicate transaction hashes within the batch. The first occurrence
-    // is executed; later ones are skipped without touching the store or the
-    // executor. This prevents double-spending within a single batch.
-    const seenHashes = new Set<string>()
-
     for (const item of items) {
-      if (seenHashes.has(item.transactionHash)) {
-        this.logger(`Skipping duplicate transaction hash in batch: ${item.transactionHash}`)
-        results.push({
-          bondId: item.bondId,
-          transactionHash: item.transactionHash,
-          status: 'pending',
-          retryEligible: false,
-        })
-        skipped++
-        continue
-      }
-      seenHashes.add(item.transactionHash)
-
       const result = await this.processItem(item)
       results.push(result)
 
