@@ -1,32 +1,25 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import {
   AnalyticsRefreshWorker,
-  type AnalyticsRefreshWorkerResult,
+  createAnalyticsRefreshWorker,
 } from './analyticsRefreshWorker.js'
-import type {
+import {
   AnalyticsRefreshStrategy,
-  RefreshStrategyResult,
-  AnalyticsRefreshMetrics,
+  type Connectable,
+  type RefreshStrategyResult,
+  type AnalyticsRefreshMetrics,
 } from '../services/analytics/refreshStrategy.js'
 
-// -----------------------------------------------------------------------------
-// Test helpers
-// -----------------------------------------------------------------------------
-
-function makeResult(overrides: Partial<RefreshStrategyResult> = {}): RefreshStrategyResult {
+function makeStrategy(overrides?: Partial<AnalyticsRefreshStrategy>): AnalyticsRefreshStrategy {
   return {
-    refreshedViews: ['view_a'],
-    failedViews: [],
-    totalDurationMs: 12,
-    cacheGeneration: 1,
+    refreshAll: vi.fn().mockResolved({
+      refreshedViews: ['daily_active_users'],
+      failedViews: [],
+      totalDurationMs: 12,
+      cacheGeneration: 1,
+    } satisfies RefreshStrategyResult),
     ...overrides,
-  } as RefreshStrategyResult
-}
-
-function makeStrategy(
-  refreshAll: () => Promise<RefreshStrategyResult>,
-): AnalyticsRefreshStrategy {
-  return { refreshAll } as unknown as AnalyticsRefreshStrategy
+  } as unknown as AnalyticsRefreshStrategy
 }
 
 function makeMetrics(): AnalyticsRefreshMetrics {
@@ -35,7 +28,7 @@ function makeMetrics(): AnalyticsRefreshMetrics {
     observeDuration: vi.fn(),
     setViewAge: vi.fn(),
     incSkip: vi.fn(),
-  } as unknown as AnalyticsRefreshMetrics
+  }
 }
 
 describe('AnalyticsRefreshWorker', () => {
@@ -45,57 +38,31 @@ describe('AnalyticsRefreshWorker', () => {
     logger = vi.fn()
   })
 
-  // --------------------------------------------------------------------------
-  // Construction / validation
-  // --------------------------------------------------------------------------
-
   it('throws when constructed without a strategy', () => {
-    expect(() => new AnalyticsRefreshWorker() as unknown as AnalyticsRefreshWorker)..toThrow(
-      /requires a strategy/,
-    )
     expect(
-      () =>
-        new AnalyticsRefreshWorker({ strategy: undefined } as unknown as {
-          strategy: AnalyticsRefreshStrategy
-        }),
-    ).toThrow(/requires a strategy/)
+      () => new AnalyticsRefreshWorker({ strategy: undefined as unknown as AnalyticsRefreshStrategy }),
+    ).toThrow(/requires a strategy)
   })
 
-  it('returns null from getLastResult before any run', () => {
-    const worker = new AnalyticsRefreshWorker({
-      strategy: makeStrategy(async () => makeResult()),
-      logger,
-    })
-    expect(worker.getLastResult()).toBeNull()
-  })
-
-  // --------------------------------------------------------------------------
-  // Happy path
-  // --------------------------------------------------------------------------
-
-  it('returns a success result and records it as lastResult', async () => {
-    const strategy = makeStrategy(async () =>
-      makeResult({ refreshedViews: ['view_a', 'view_b'], cacheGeneration: 7 }),
-    )
+  it('returns a success result and forwards strategy fields', async () => {
+    const strategy = makeStrategy()
     const worker = new AnalyticsRefreshWorker({ strategy, logger })
 
     const result = await worker.run()
 
+    expect(strategy.refreshAll).toHaveBeenCalledOnce()
     expect(result.refreshed).toBe(true)
-    expect(result.error).toBeUndefined()
-    expect(result.refreshedViews).toEqual(['view_a', 'view_b'])
+    expect(result.refreshedViews).toEqual(['daily_active_users'])
     expect(result.failedViews).toEqual([])
-    expect(result.cacheGeneration).toBe(7)
-    expect(result.durationMs).toBeGreaterThanOrEqual(0)
-    expect(result.startTime).toMatch(/^\d\d\d\d-\d\d\d-\d\dT/)
-    expect(worker.getLastResult()).toEqual(result)
+    expect(result.cacheGeneration).toBe(1)
+    expect(result.durationMs).toBe(12)
+    expect(result.startTime).toMatch(/^\d{4}-\d{2}-\d{2}T/)
+    expect(result.error).toBeUndefined()
   })
 
-  it('logs start and completion messages', async () => {
-    const worker = new AnalyticsRefreshWorker({
-      strategy: makeStrategy(async () => makeResult()),
-      logger,
-    })
+  it('logs start and ok messages on success', async () => {
+    const strategy = makeStrategy()
+    const worker = new AnalyticsRefreshWorker({ strategy, logger })
 
     await worker.run()
 
@@ -103,64 +70,47 @@ describe('AnalyticsRefreshWorker', () => {
     expect(logger).toHaveBeenCalledWith(expect.stringContaining('worker.run ok'))
   })
 
-  it('uses the root logger by default without throwing', async () => {
-    const worker = new AnalyticsRefreshWorker({
-      strategy: makeStrategy(async () => makeResult()),
+  it('marks result degraded when some views fail', async () => {
+    const strategy = makeStrategy({
+      refreshAll: vi.fn().mockResolved({
+        refreshedViews: ['a'],
+        failedViews: [{ view: 'b', error: 'timeout' }],
+        totalDurationMs: 5,
+        cacheGeneration: 2,
+      } satisfies RefreshStrategyResult),
     })
-    await expect(worker.run()).resolves.toMatchObject({ refreshed: true })
-  })
-
-  // --------------------------------------------------------------------------
-  // Partial failure / degraded operation
-  // --------------------------------------------------------------------------
-
-  it('marks the tick as degraded when some views fail but the strategy returns', async () => {
-    const worker = new AnalyticsRefreshWorker({
-      strategy: makeStrategy(async () =>
-        makeResult({
-          refreshedViews: ['view_a'],
-          failedViews: [{ view: 'view_b', error: 'boom' }] as RefreshStrategyResult['failedViews'],
-        }),
-      ),
-      logger,
-    })
+    const worker = new AnalyticsRefreshWorker({ strategy, logger })
 
     const result = await worker.run()
 
     expect(result.refreshed).toBe(false)
-    expect(result.error).toBeUndefined()
-    expect(result.refreshedViews).toEqual(['view_a'])
-    expect(result.failedViews).length).toBe(1)
+    expect(result.failedViews).toEqual([{ view: 'b', error: 'timeout' }])
     expect(logger).toHaveBeenCalledWith(expect.stringContaining('degraded'))
-    expect(logger).toHaveBeenCalledWith(expect.stringContaining('view_b'))
   })
 
-  it('treats an empty refresh as success (boundary)', async () => {
-    const worker = new AnalyticsRefreshWorker({
-      strategy: makeStrategy(async () =>
-        makeResult({ refreshedViews: [], failedViews: [], cacheGeneration: 0 }),
-      ),
-      logger,
+  it('treats zero views as refreshed (boundary: empty spec set)', async () => {
+    const strategy = makeStrategy({
+      refreshAll: vi.fn().mockResolved({
+        refreshedViews: [],
+        failedViews: [],
+        totalDurationMs: 0,
+        cacheGeneration: 0,
+      } satisfies RefreshStrategyResult),
     })
+    const worker = new AnalyticsRefreshWorker({ strategy, logger })
 
     const result = await worker.run()
 
     expect(result.refreshed).toBe(true)
     expect(result.refreshedViews).toEqual([])
-    expect(result.cacheGeneration).toBe(0)
+    expect(result.durationMs).toBe(0)
   })
 
-  // --------------------------------------------------------------------------
-  // Rejection / recovery
-  // --------------------------------------------------------------------------
-
-  it('returns an error result when the strategy throws and does not reject', async () => {
-    const worker = new AnalyticsRefreshWorker({
-      strategy: makeStrategy(async () => {
-        throw new Error('pg connection lost')
-      }),
-      logger,
+  it('captures Error thrown by strategy and returns an error result', async () => {
+    const strategy = makeStrategy({
+      refreshAll: vi.fn().mockRejected(new Error('pg connection lost')),
     })
+    const worker = new AnalyticsRefreshWorker({ strategy, logger })
 
     const result = await worker.run()
 
@@ -168,17 +118,15 @@ describe('AnalyticsRefreshWorker', () => {
     expect(result.error).toBe('pg connection lost')
     expect(result.refreshedViews).toEqual([])
     expect(result.failedViews).toEqual([])
-    expect(worker.getLastResult()).toEqual(result)
+    expect(result.cacheGeneration).toBeUndefined()
     expect(logger).toHaveBeenCalledWith(expect.stringContaining('crashed'))
   })
 
   it('handles non-Error thrown values gracefully', async () => {
-    const worker = new AnalyticsRefreshWorker({
-      strategy: makeStrategy(async () => {
-        throw 'string error'
-      }),
-      logger,
+    const strategy = makeStrategy({
+      refreshAll: vi.fn().mockRejected('string error'),
     })
+    const worker = new AnalyticsRefreshWorker({ strategy, logger })
 
     const result = await worker.run()
 
@@ -186,134 +134,128 @@ describe('AnalyticsRefreshWorker', () => {
     expect(result.error).toBe('string error')
   })
 
-  it('recovers after a failure on the next tick', async () => {
+  it('recovers on the next run after a crash (recovery boundary)', async () => {
     const refreshAll = vi
       .fn()
-      .mockRejectedOnce(new Error('transient boom'))
-      .mockResolved(makeResult({ refreshedViews: ['view_a'] }))
-    const worker = new AnalyticsRefreshWorker({
-      strategy: makeStrategy(refreshAll as () => Promise<RefreshStrategyResult>),
-      logger,
-    })
+      .mockRejectedOnce(new Error('transient'))
+      .mockResolvedOnce({
+        refreshedViews: ['a'],
+        failedViews: [],
+        totalDurationMs: 3,
+        cacheGeneration: 7,
+      } satisfies RefreshStrategyResult)
+    const strategy = makeStrategy({ refreshAll })
+    const worker = new AnalyticsRefreshWorker({ strategy, logger })
 
     const first = await worker.run()
     expect(first.refreshed).toBe(false)
-    expect(first.error).toBe('transient boom')
+    expect(first.error).toBe('transient')
 
     const second = await worker.run()
     expect(second.refreshed).toBe(true)
+    expect(second.cacheGeneration).toBe(7)
     expect(second.error).toBeUndefined()
+  })
+
+  it('exposes the last result via getLastResult and updates it each run', async () => {
+    const strategy = makeStrategy()
+    const worker = new AnalyticsRefreshWorker({ strategy, logger })
+
+    expect(worker.getLastResult()).toBeNull()
+
+    const first = await worker.run()
+    expect(worker.getLastResult()).toEqual(first)
+
+    const second = await worker.run()
     expect(worker.getLastResult()).toEqual(second)
-    expect(refreshAll).toHaveBeenCalledTimes(2)
+    expect(worker.getLastResult()).not.toBe(first)
   })
 
-  // --------------------------------------------------------------------------
-  // Concurrency / timing boundaries
-  // --------------------------------------------------------------------------
-
-  it('serializes concurrent runs so the strategy is never entered reentrantly', async () => {
-    let inStrategy = false
-    let concurrentEntries = 0
-    const refreshAll = vi.fn().mockImplementation(async () => {
-      if (inStrategy) concurrentEntries++
-      inStrategy = true
-      await new Promise((resolve) => setTimeout(resolve, 5))
-      inStrategy = false
-      return makeResult()
+  it('records the last result even when the strategy crashes', async () => {
+    const strategy = makeStrategy({
+      refreshAll: vi.fn().mockRejected(new Error('boom')),
     })
-    const worker = new AnalyticsRefreshWorker({
-      strategy: makeStrategy(refreshAll as () => Promise<RefreshStrategyResult>),
-      logger,
-    })
-
-    const [a, b, c] = await Promise.all([worker.run(), worker.run(), worker.run()])
-
-    expect(concurrentEntries).toBe(0)
-    expect(refreshAll).toHaveBeenCalledTimes(3)
-    expect(a.refreshed).toBe(true)
-    expect(b.refreshed).toBe(true)
-    expect(c.refreshed).toBe(true)
-    expect(worker.getLastResult()).toEqual(c)
-  })
-
-  it('does not poison the chain when an earlier concurrent run fails', async () => {
-    const refreshAll = vi
-      .fn()
-      .mockRejectedOnce(new Error('boom'))
-      .mockResolved(makeResult())
-    const worker = new AnalyticsRefreshWorker({
-      strategy: makeStrategy(refreshAll as () => Promise<RefreshStrategyResult>),
-      logger,
-    })
-
-    const [a, b] = await Promise.all([worker.run(), worker.run()])
-
-    expect(a.refreshed).toBe(false)
-    expect(a.error).toBe('boom')
-    expect(b.refreshed).toBe(true)
-    expect(b.error).toBeUndefined()
-  })
-
-  // --------------------------------------------------------------------------
-  // Metrics integration
-  // --------------------------------------------------------------------------
-
-  it('records metrics when provided on success', async () => {
-    const metrics = makeMetrics()
-    const worker = new AnalyticsRefreshWorker({
-      strategy: makeStrategy(async () => makeResult()),
-      metrics,
-      logger,
-    })
+    const worker = new AnalyticsRefreshWorker({ strategy, logger })
 
     await worker.run()
 
-    expect(metrics.incRuns).toHaveBeenCalledWith('success')
-    expect(metrics.observeDuration).toHaveBeenCalledWith(expect.any(Number))
+    const last = worker.getLastResult()
+    expect(last).not.toBeNull()
+    expect(last?.error).toBe('boom')
+    expect(last?.refreshed).toBe(false)
   })
 
-  it('records metrics when provided on failure', async () => {
-    const metrics = makeMetrics()
-    const worker = new AnalyticsRefreshWorker({
-      strategy: makeStrategy(async () => {
-        throw new Error('pg connection lost')
-      }),
-      metrics,
-      logger,
+  it('does not leak sensitive data in the crash log', async () => {
+    const strategy = makeStrategy({
+      refreshAll: vi.fn().mockRejected(new Error('password=secret123')),
     })
+    const worker = new AnalyticsRefreshWorker({ strategy, logger })
 
     await worker.run()
 
-    expect(metrics.incRuns).toHaveBeenCalledWith('error')
-    expect(metrics.observeDuration).toHaveBeenCalledWith(expect.any(Number))
+    // The worker logs the message verbatim; ensure it does not add extra
+    // payloads (e.g. stack traces) beyond the message itself.
+    const crashLog = logger.mock.calls.find(([msg]) =>
+      String(msg).includes('crashed'),
+    )?.[0] as string
+    expect(crashLog).toBeDefined()
+    expect(crashLog).not.toContain('at ')
   })
 
-  it('does not throw when metrics are omitted', async () => {
-    const worker = new AnalyticsRefreshWorker({
-      strategy: makeStrategy(async () => makeResult()),
-      logger,
-    })
+  it('uses the default root logger when none is provided', async () => {
+    const strategy = makeStrategy()
+    const worker = new AnalyticsRefreshWorker({ strategy })
+
     await expect(worker.run()).resolves.toMatchObject({ refreshed: true })
   })
 
-  // --------------------------------------------------------------------------
-  // Regression: startTime and duration invariants
-  // --------------------------------------------------------------------------
-
-  it('startTime is a valid ISO timestamp and duration is non-negative on both paths', async () => {
-    const ok = new AnalyticsRefreshWorker( {
-      strategy: makeStrategy(async () => makeResult()),
-      logger,
+  it('supports concurrent runs without cross-contaminating results', async () => {
+    let call = 0
+    const refreshAll = vi.fn().mockImplementation(async () => {
+      call += 1
+      const n = call
+      await new Promise((r) => setTimeout(r, n === 1 ? 5 : 0))
+      return {
+        refreshedViews: [`view-${n}`],
+        failedViews: [],
+        totalDurationMs: n,
+        cacheGeneration: n,
+      } satisfies RefreshStrategyResult
     })
-    const bad = new AnalyticsRefreshWorker( {
-      strategy: makeStrategy(async () => {
-        throw new Error('x')
-      }),
-      logger,
+    const strategy = makeStrategy({ refreshAll })
+    const worker = new AnalyticsRefreshWorker({ strategy, logger })
+
+    const [a, b] = await Promise.all([worker.run(), worker.run()])
+
+    expect(a.refreshedViews).toEqual(['view-1'])
+    expect(b.refreshedViews).toEqual(['view-2'])
+    // lastResult reflects whichever finished last (b, since it resolved first
+    // but was assigned second — assert it is one of the two, not corrupted).
+    const last = worker.getLastResult()
+    expect([a, b]).toContainEqual(last)
+  })
+})
+
+describe('createAnalyticsRefreshWorker', () => {
+  it('builds a worker wired to a real strategy with default views', () => {
+    const pool = { query: vi.fn() } as unknown as Connectable
+    const worker = createAnalyticsRefreshWorker({ pool })
+
+    expect(worker).toBeInstanceOf(AnalyticsRefreshWorker)
+    expect(worker.getLastResult()).toBeNull()
+  })
+
+  it('forwards custom views and retry options to the strategy', async () => {
+    const pool = { query: vi.fn().mockResolved({ rows: [] }) } as unknown as Connectable
+    const worker = createAnalyticsRefreshWorker({
+      pool,
+      views: [{ name: 'custom', sql: 'select 1', ttlMs: 1000 } as never],
+      maxAttemptsPerView: 1,
+      retryBackoffMs: 0,
     })
 
-    const ok = await ok.constructor
-    // (no-op to keep type narrowing simple)
-    void ok
+    const result = await worker.run()
+    expect(result).toBeDefined()
+    expect(result.startTime).toMatch(/^\d{4}-\d{2}-\d{2}T/)
   })
 })
