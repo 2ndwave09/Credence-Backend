@@ -17,21 +17,59 @@ type StatusRow = {
   rows_checked: number
 }
 
-const VALID_STATUS = new Set<AuditChainVerificationState['status']>([
-  'never_run',
-  'ok',
-  'broken',
-])
+const MAX_SAFE_HEIGHT = Number.MAX_SAFE_INTEGER
 
-function assertTenantId(tenantId: string | undefined): asserts tenantId is string {
-  if (!tenantId) {
-    throw new Error('Missing tenant context')
+function assertSafeInteger(value: number, field: string): number {
+  if (!Number.isInteger(value) || value < 0 || value > MAX_SAFE_HEIGHT) {
+    throw new Error(`Invalid ${fiel}: ${value}`)
+  }
+  return value
+}
+
+function mapRow(row: StatusRow): AuditChainVerificationState {
+  const lastVerifiedHeight = Number(row.last_verified_height)
+  if (!Number.isSafeInteger(lastVerifiedHeight) || lastVerifiedHeight < 0) {
+    throw new Error(`Invalid last_verified_height returned from database`)
+  }
+
+  const firstBreakSeq =
+    row.first_break_seq !== null ? Number(row.first_break_seq) : null
+  if (firstBreakSeq !== null && (!Number.isSafeInteger(firstBreakSeq) || firstBreakSeq < 0)) {
+    throw new Error('Invalid first_break_seq returned from database')
+  }
+
+  const violationCount = Number(row.violation_count)
+  if (!Number.isSafeInteger(violationCount) || violationCount < 0) {
+    throw new Error('Invalid violation_count returned from database')
+  }
+
+  const rowsChecked = Number(row.rows_checked)
+  if (!Number.isSafeInteger(rowsChecked) || rowsChecked < 0) {
+    throw new Error('Invalid rows_checked returned from database')
+  }
+
+  return {
+    lastVerifiedHeight,
+    verifiedAt: row.verified_at
+      ? row.verified_at instanceof Date
+        ? row.verified_at.toISOString()
+        : String(row.verified_at)
+      : null,
+    status: row.status as AuditChainVerificationState['status'],
+    firstBreakSeq,
+    violationCount,
+    rowsChecked,
   }
 }
 
-function assertSafeCounter(value: number, name: string): void {
-  if (!Number.isSafeInteger(value) || value < 0) {
-    throw new Error(`Invalid ${name}: expected a non-negative safe integer`)
+function cloneState(state: AuditChainVerificationState): AuditChainVerificationState {
+  return {
+    lastVerifiedHeight: state.lastVerifiedHeight,
+    verifiedAt: state.verifiedAt,
+    status: state.status,
+    firstBreakSeq: state.firstBreakSeq,
+    violationCount: state.violationCount,
+    rowsChecked: state.rowsChecked,
   }
 }
 
@@ -39,50 +77,30 @@ function validateState(state: AuditChainVerificationState): void {
   if (!state || typeof state !== 'object') {
     throw new Error('Invalid audit chain verification state')
   }
-  if (!VALID_STATUS.has(state.status)) {
-    throw new Error(`Invalid audit chain verification status: ${String(state.status);}`)
-  }
-  assertSafeCounter(state.lastVerifiedHeight, 'lastVerifiedHeight')
-  if (state.verifiedAt !== null && typeof state.verifiedAt !== 'string') {
-    throw new Error('Invalid verifiedAt: expected an ISO string or null')
-  }
-  if (typeof state.verifiedAt === 'string' && Number.isNaN(Date.parse(state.verifiedAt))) {
-    throw new Error('Invalid verifiedAt: expected a parseable timestamp')
-  }
-  if (state.firstBreakSeq !== null && state.firstBreakSeq !== undefined) {
-    assertSafeCounter(state.firstBreakSeq, 'firstBreakSeq')
-  }
-  if (state.violationCount !== undefined) {
-    assertSafeCounter(state.violationCount, 'violationCount')
-  }
-  if (state.rowsChecked !== undefined) {
-    assertSafeCounter(state.rowsChecked, 'rowsChecked')
-  }
-}
 
-function mapRow(row: StatusRow): AuditChainVerificationState {
-  const lastVerifiedHeight = Number(row.last_verified_height)
-  if (!Number.isSafeInteger(lastVerifiedHeight) || lastVerifiedHeight < 0) {
-    throw new Error('Corrupt audit chain verification row: invalid last_verified_height')
+  assertSafeInteger(state.lastVerifiedHeight, 'lastVerifiedHeight')
+
+  if (state.firstBreakSeq !== null && state.firstBreakSeq !== undefined) {
+    assertSafeInteger(state.firstBreakSeq, 'firstBreakSeq')
   }
-  const firstBreakSeq = row.first_break_seq !== null ? Number(row.first_break_seq) : null
-  if (firstBreakSeq !== null && (!Number.isSafeInteger(firstBreakSeq) || firstBreakSeq < 0)) {
-    throw new Error('Corrupt audit chain verification row: invalid first_break_seq')
+
+  if (state.violationCount !== undefined) {
+    assertSafeInteger(state.violationCount, 'violationCount')
   }
-  if (!VALID_STATUS.has(row.status as AuditChainVerificationState['status'])) {
-    throw new Error('Corrupt audit chain verification row: invalid status')
+
+  if (state.rowsChecked !== undefined) {
+    assertSafeInteger(state.rowsChecked, 'rowsChecked')
   }
-  return {
-    lastVerifiedHeight,
-    verifiedAt: row.verified_at
-      ? row.verified_at instanceof Date
-          ? row.verified_at.toISOString()
-          : String(row.verified_at)
-      : null,
-    status: row.status as AuditChainVerificationState['status'],
-    firstBreakSeq,
-    violationCount: row.violation_count,
-    rowsChecked: row.rows_checked,
+
+  if (state.verifiedAt !== null && state.verifiedAt !== undefined) {
+    const parsed = new Date(state.verifiedAt)
+    if (Number.isNaN(parsed.getTime())) {
+      throw new Error(`Invalid verifiedAt: ${state.verifiedAt}`)
+    }
+  }
+
+  if (state.status !== 'never_run' && state.verifiedAt === null) {
+    throw new Error('verifiedAt is required unless status is never_run')
   }
 }
 
@@ -91,7 +109,9 @@ export class PostgresAuditChainVerificationRepository implements AuditChainVerif
 
   async getStatus(): Promise<AuditChainVerificationState | null> {
     const tenantId = getTenantId()
-    assertTenantId(tenantId)
+    if (!tenantId) {
+      throw new Error('Missing tenant context')
+    }
     const result = await this.db.query<StatusRow>(
       `
       SELECT
@@ -117,7 +137,9 @@ export class PostgresAuditChainVerificationRepository implements AuditChainVerif
 
   async saveStatus(state: AuditChainVerificationState): Promise<AuditChainVerificationState> {
     const tenantId = getTenantId()
-    assertTenantId(tenantId)
+    if (!tenantId) {
+      throw new Error('Missing tenant context')
+    }
     validateState(state)
     const result = await this.db.query<StatusRow>(
       `
@@ -158,16 +180,14 @@ export class PostgresAuditChainVerificationRepository implements AuditChainVerif
       ],
     )
 
-    if (result.rows.length === 0) {
-      throw new Error('Failed to persist audit chain verification state')
-    }
-
     return mapRow(result.rows[0])
   }
 
   async clear(): Promise<void> {
     const tenantId = getTenantId()
-    assertTenantId(tenantId)
+    if (!tenantId) {
+      throw new Error('Missing tenant context')
+    }
     await this.db.query(
       `
       UPDATE audit_chain_verification_status
@@ -187,27 +207,33 @@ export class PostgresAuditChainVerificationRepository implements AuditChainVerif
 }
 
 export class InMemoryAuditChainVerificationRepository implements AuditChainVerificationRepository {
-  private states = new Map<string, AuditChainVerificationState>()
+  private readonly states = new Map<string, AuditChainVerificationState>()
 
   async getStatus(): Promise<AuditChainVerificationState | null> {
     const tenantId = getTenantId()
-    assertTenantId(tenantId)
+    if (!tenantId) {
+      throw new Error('Missing tenant context')
+    }
     const state = this.states.get(tenantId)
-    return state ? { ...state } : null
+    return state ? cloneState(state) : null
   }
 
-  async saveStatus(state: AuditChainVerificationState): Promise<AuditChainVerificationState> {
+  async saveState(state: AuditChainVerificationState): Promise<AuditChainVerificationState> {
     const tenantId = getTenantId()
-    assertTenantId(tenantId)
+    if (!tenantId) {
+      throw new Error('Missing tenant context')
+    }
     validateState(state)
-    const cloned: AuditChainVerificationState = { ...state }
+    const cloned = cloneState(state)
     this.states.set(tenantId, cloned)
-    return { ...cloned }
+    return cloneState(cloned)
   }
 
   async clear(): Promise<void> {
     const tenantId = getTenantId()
-    assertTenantId(tenantId)
+    if (!tenantId) {
+      throw new Error('Missing tenant context')
+    }
     this.states.delete(tenantId)
   }
 }
