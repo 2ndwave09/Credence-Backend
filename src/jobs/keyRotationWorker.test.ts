@@ -108,6 +108,24 @@ describe('reencryptRecord', () => {
 
     expect(() => reencryptRecord(record, wrongKek, newKek)).toThrow()
   })
+
+  it('throws on tampered ciphertext', () => {
+    const oldKek = makeKek(1)
+    const newKek = makeKek(2)
+    const record = encryptRecord('ev-1', 'data', oldKek)
+    const tampered = { ...record, encryptedBlob: 'ff' + record.encryptedBlob.slice(2) }
+
+    expect(() => reencryptRecord(tampered, oldKek, newKek)).toThrow()
+  })
+
+  it('throws on malformed IV', () => {
+    const oldKek = makeKek(1)
+    const newKek = makeKek(2)
+    const record = encryptRecord('ev-1', 'data', oldKek)
+    const tampered = { ...record, iv: 'not-hex' }
+
+    expect(() => reencryptRecord(tampered, oldKek, newKek)).toThrow()
+  })
 })
 
 // ── KeyRotationWorker ────────────────────────────────────────────────────────
@@ -197,6 +215,27 @@ describe('KeyRotationWorker', () => {
     expect(result.reencrypted).toBe(1)
   })
 
+  it('does not update the record when re-encryption fails', async () => {
+    const record = encryptRecord('ev-1', 'data', oldKek)
+    const store = makeStore([record])
+    const updateSpy = vi.spyOn(store, 'update')
+    const tampered = { ...record, authTag: 'deadbeef'.repeat(4) }
+    const tamperedStore: EvidenceStore = {
+      ...store,
+      async listPage() {
+        return [tampered]
+      },
+    }
+
+    const worker = new KeyRotationWorker(tamperedStore)
+    const result = await worker.run(oldKek, newKek)
+
+    expect(result.failed).toBe(1)
+    expect(result.reencrypted).toBe(0)
+    expect(updateSpy).not.toHaveBeenCalled()
+    expect((store as any)._db.get('ev-1').kek_version).toBe(1)
+  })
+
   it('respects AbortSignal and marks result as interrupted', async () => {
     const records = Array.from({ length: 10 }, (_, i) =>
       encryptRecord(`ev-${i}`, `data-${i}`, oldKek),
@@ -222,6 +261,41 @@ describe('KeyRotationWorker', () => {
 
     expect(result.interrupted).toBe(true)
     expect(result.reencrypted).toBeLessThan(10)
+  })
+
+  it('does not start work when signal is already aborted', async () => {
+    const records = [
+      encryptRecord('ev-1', 'data', oldKek),
+      encryptRecord('ev-2', 'data', oldKek),
+    ]
+    const store = makeStore(records)
+    const updateSpy = vi.spyOn(store, 'update')
+    const controller = new AbortController()
+    controller.abort()
+
+    const worker = new KeyRotationWorker(store)
+    const result = await worker.run(oldKek, newKek, controller.signal)
+
+    expect(result.interrupted).toBe(true)
+    expect(result.reencrypted).toBe(0)
+    expect(updateSpy).not.toHaveBeenCalled()
+  })
+
+  it('is idempotent when re-run after a full rotation', async () => {
+    const records = [
+      encryptRecord('ev-1', 'data-1', oldKek),
+      encryptRecord('ev-2', 'data-2', oldKek),
+    ]
+    const store = makeStore(records)
+    const worker = new KeyRotationWorker(store)
+
+    const first = await worker.run(oldKek, newKek)
+    const second = await worker.run(oldKek, newKek)
+
+    expect(first.reencrypted).toBe(2)
+    expect(second.reencrypted).toBe(0)
+    expect(second.skipped).toBe(2)
+    expect(second.failed).toBe(0)
   })
 
   it('emits progress callbacks at the configured interval', async () => {
@@ -253,6 +327,21 @@ describe('KeyRotationWorker', () => {
     expect(result.interrupted).toBe(false)
   })
 
+  it('handles a store with only already-rotated records', async () => {
+    const records = [
+      encryptRecord('ev-1', 'data-1', newKek),
+      encryptRecord('ev-2', 'data-2', newKek),
+    ]
+    const store = makeStore(records)
+    const worker = new KeyRotationWorker(store)
+
+    const result = await worker.run(oldKek, newKek)
+
+    expect(result.reencrypted).toBe(0)
+    expect(result.skipped).toBe(2)
+    expect(result.failed).toBe(0)
+  })
+
   it('processes records in batches (pagination)', async () => {
     const records = Array.from({ length: 25 }, (_, i) =>
       encryptRecord(`ev-${i}`, `data-${i}`, oldKek),
@@ -268,6 +357,20 @@ describe('KeyRotationWorker', () => {
     expect(listPageSpy).toHaveBeenCalledTimes(4)
   })
 
+  it('handles a batch size larger than the total record count', async () => {
+    const records = [
+      encryptRecord('ev-1', 'data-1', oldKek),
+      encryptRecord('ev-2', 'data-2', oldKek),
+    ]
+    const store = makeStore(records)
+    const worker = new KeyRotationWorker(store, { batchSize: 100 })
+
+    const result = await worker.run(oldKek, newKek)
+
+    expect(result.reencrypted).toBe(2)
+    expect(result.failed).toBe(0)
+  })
+
   it('logs progress via logger option', async () => {
     const records = [encryptRecord('ev-1', 'data', oldKek)]
     const store = makeStore(records)
@@ -278,5 +381,19 @@ describe('KeyRotationWorker', () => {
 
     expect(logs.some((l) => l.includes('Starting rotation'))).toBe(true)
     expect(logs.some((l) => l.includes('Rotation complete'))).toBe(true)
+  })
+
+  it('does not leak plaintext or key material in logs', async () => {
+    const records = [encryptRecord('ev-1', 'top-secret-value', oldKek)]
+    const store = makeStore(records)
+    const logs: string[] = []
+
+    const worker = new KeyRotationWorker(store, { logger: (msg) => logs.push(msg) })
+    await worker.run(oldKek, newKek)
+
+    const joined = logs.join('\n')
+    expect(joined).not.toContain('top-secret-value')
+    expect(joined).not.toContain(oldKek.keyMaterial.toString('hex'))
+    expect(joined).not.toContain(newKek.keyMaterial.toString('hex'))
   })
 })
