@@ -1,5 +1,5 @@
 import crypto from 'crypto'
-import { promisify } from 'util'
+import crypto from 'crypto'
 import type { EvidenceRecord } from '../services/evidence/storage.js'
 import type { KekVersion } from '../services/keyManager/types.js'
 
@@ -18,6 +18,7 @@ export interface RotationResult extends RotationProgress {
   newVersion: number
   oldVersion: number
   interrupted: boolean
+  errors: RotationError[]
 }
 
 /**
@@ -30,8 +31,12 @@ export interface EvidenceStore {
   update(record: EvidenceRecord): Promise<void>
   /** Total count of records (for progress reporting). */
   count(): Promise<number>
-  /** Optional: fetch a single record by id for recovery/verification. */
-  get?(evidenceId: string): Promise<EvidenceRecord | null>
+}
+
+export interface RotationError {
+  evidenceId: string
+  message: string
+  kekVersion: number
 }
 
 export interface RotationWorkerOptions {
@@ -43,12 +48,8 @@ export interface RotationWorkerOptions {
   onProgress?: (progress: RotationProgress) => void
   /** Logger function. Default: no-op. */
   logger?: (msg: string) => void
-  /** Max retry attempts per record on transient failure. Default: 3. */
-  maxRetries?: number
-  /** Base backoff in ms between retries (exponential). Default: 25. */
-  retryBackoffMs?: number
-  /** Optional sleep injection for deterministic tests. */
-  sleep?: (ms: number) => Promise<void>
+  /** Maximum number of errors to retain in the result. Default: 100. */
+  maxErrors?: number
 }
 
 // ── Worker ───────────────────────────────────────────────────────────────────
@@ -71,9 +72,7 @@ export class KeyRotationWorker {
   private readonly progressInterval: number
   private readonly onProgress: (p: RotationProgress) => void
   private readonly logger: (msg: string) => void
-  private readonly maxRetries: number
-  private readonly retryBackoffMs: number
-  private readonly sleep: (ms: number) => Promise<void>
+  private readonly maxErrors: number
 
   constructor(
     private readonly store: EvidenceStore,
@@ -83,9 +82,7 @@ export class KeyRotationWorker {
     this.progressInterval = options.progressInterval ?? 50
     this.onProgress = options.onProgress ?? (() => {})
     this.logger = options.logger ?? (() => {})
-    this.maxRetries = options.maxRetries ?? 3
-    this.retryBackoffMs = options.retryBackoffMs ?? 25
-    this.sleep = options.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)))
+    this.maxErrors = options.maxErrors ?? 100
   }
 
   /**
@@ -100,10 +97,6 @@ export class KeyRotationWorker {
     newKek: KekVersion,
     signal?: AbortSignal,
   ): Promise<RotationResult> {
-    if (oldKek.version === newKek.version) {
-      throw new Error(`Rotation requires distinct KEK versions (got v${oldKek.version})`)
-    }
-
     const startTime = new Date().toISOString()
     const startMs = Date.now()
     const total = await this.store.count()
@@ -113,7 +106,7 @@ export class KeyRotationWorker {
     let failed = 0
     let offset = 0
     let interrupted = false
-    let processed = 0
+    const errors: RotationError[] = []
 
     this.logger(`Starting rotation: v${oldKek.version} → v${newKek.version}, ${total} records`)
 
@@ -136,23 +129,39 @@ export class KeyRotationWorker {
         // Skip records already on the new version (idempotent re-runs)
         if (record.kek_version === newKek.version) {
           skipped++
-          processed++
           continue
         }
 
         // Only re-encrypt records on the target old version
         if (record.kek_version !== oldKek.version) {
           skipped++
-          processed++
           continue
         }
 
-        const outcome = await this.processRecordWithRetry(record, oldKek, newKek, signal)
-        if (outcome === 'reencrypted') reencrypted++
-        else if (outcome === 'skipped') skipped++
-        else failed++
-        processed++
+        if (!isValidRecord(record)) {
+          failed++
+          const msg = `Invalid record shape for ${record.evidence_id}`
+          this.logger(msg)
+          if (errors.length < this.maxErrors) {
+            errors.push({ evidenceId: record.evidence_id, message: msg, kekVersion: record.kek_version })
+          }
+          continue
+        }
 
+        try {
+          const reencrypted_record = reencryptRecord(record, oldKek, newKek)
+          await this.store.update(reencrypted_record)
+          reencrypted++
+        } catch (err) {
+          failed++
+          const msg = err instanceof Error ? err.message : String(err)
+          this.logger(`Failed to re-encrypt ${record.evidence_id}: ${msg}`)
+          if (errors.length < this.maxErrors) {
+            errors.push({ evidenceId: record.evidence_id, message: msg, kekVersion: record.kek_version })
+          }
+        }
+
+        const processed = reencrypted + skipped + failed
         if (processed % this.progressInterval === 0) {
           this.onProgress({
             total,
@@ -179,6 +188,7 @@ export class KeyRotationWorker {
       newVersion: newKek.version,
       oldVersion: oldKek.version,
       interrupted,
+      errors,
     }
 
     this.logger(
@@ -187,77 +197,22 @@ export class KeyRotationWorker {
 
     return result
   }
-
-  /**
-   * Process a single record with bounded retries on transient failures.
-   *
-   * Invariants:
-   * - A record is only marked re-encrypted after `store.update` resolves.
-   * - On abort during retry backoff, we stop retrying and report failure so
-   *   the caller can resume safely (record remains on old version).
-   * - Non-retryable errors (e.g. auth tag mismatch) fail fast.
-   */
-  private async processRecordWithRetry(
-    record: EvidenceRecord,
-    oldKek: KekVersion,
-    newKek: KekVersion,
-    signal?: AbortSignal,
-  ): Promise<'reencrypted' | 'skipped' | 'failed'> {
-    let attempt = 0
-    let lastErr: unknown
-
-    while (attempt <= this.maxRetries) {
-      if (signal?.aborted) {
-        this.logger(`Aborted before processing ${record.evidence_id}`)
-        return 'failed'
-      }
-
-      try {
-        const next = reencryptRecord(record, oldKek, newKek)
-        await this.store.update(next)
-        return 'reencrypted'
-      } catch (err) {
-        lastErr = err
-        const msg = err instanceof Error ? err.message : String(err)
-
-        if (!isRetryable(err)) {
-          this.logger(`Non-retryable failure for ${record.evidence_id}: ${msg}`)
-          return 'failed'
-        }
-
-        attempt++
-        if (attempt > this.maxRetries) break
-
-        const backoff = this.retryBackoffMs * 2 ** (attempt - 1)
-        this.logger(
-          `Retry ${attempt}/${this.maxRetries} for ${record.evidence_id} in ${backoff}ms: ${msg}`,
-        )
-        await this.sleep(backoff)
-      }
-    }
-
-    const msg = lastErr instanceof Error ? lastErr.message : String(lastErr)
-    this.logger(`Failed to re-encrypt ${record.evidence_id} after retries: ${msg}`)
-    return 'failed'
-  }
 }
 
 // ── Pure helper ──────────────────────────────────────────────────────────────
 
 /**
- * Classify an error as retryable. Auth/tag mismatches and validation errors
- * are permanent; transient I/O and connection errors are retryable.
+ * Validate that a record has the fields required for re-encryption.
+ * Guards against malformed rows that would otherwise throw deep inside crypto.
  */
-export function isRetryable(err: unknown): boolean {
-  if (!err) return false
-  const code = (err as { code?: string }).code
-  if (code && ['ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'EPIPE', 'EAI_AGAIN'].includes(code)) {
-    return true
-  }
-  const msg = err instanceof Error ? err.message : String(err)
-  if (/unable to authenticate|bad decrypt|auth tag|invalid/i.test(msg)) return false
-  if (/timeout|temporar|retry|unavailable|throttl/i.test(msg)) return true
-  return false
+function isValidRecord(record: EvidenceRecord): boolean {
+  if (!record || typeof record !== 'object') return false
+  if (typeof record.evidence_id !== 'string' || record.evidence_id.length === 0) return false
+  if (typeof record.encryptedBlob !== 'string' || record.encryptedBlob.length === 0) return false
+  if (typeof record.iv !== 'string' || record.iv.length === 0) return false
+  if (typeof record.authTag !== 'string' || record.authTag.length === 0) return false
+  if (typeof record.kek_version !== 'number' || !Number.isFinite(record.kek_version)) return false
+  return true
 }
 
 /**
@@ -269,20 +224,21 @@ export function reencryptRecord(
   oldKek: KekVersion,
   newKek: KekVersion,
 ): EvidenceRecord {
-  const ALG = 'aes-256-gcm'
+  if (!isValidRecord(record)) {
+    throw new Error(`Invalid record for re-encryption: ${record?.evidence_id ?? 'unknown'}`)
+  }
 
-  if (!oldKek.keyMaterial || oldKek.keyMaterial.length !== 32) {
-    throw new Error(`Invalid old KEK material for v${oldKek.version}`)
-  }
-  if (!newKek.keyMaterial || newKek.keyMaterial.length !== 32) {
-    throw new Error(`Invalid new KEK material for v${newKek.version}`)
-  }
+  const ALG = 'aes-256-gcm'
 
   // Decrypt
   const decipher = crypto.createDecipheriv(ALG, oldKek.keyMaterial, Buffer.from(record.iv, 'hex'))
   decipher.setAuthTag(Buffer.from(record.authTag, 'hex'))
   let plaintext = decipher.update(record.encryptedBlob, 'hex', 'utf8')
   plaintext += decipher.final('utf8')
+
+  if (plaintext.length === 0) {
+    throw new Error(`Empty plaintext after decryption for ${record.evidence_id}`)
+  }
 
   // Re-encrypt with new KEK
   const newIv = crypto.randomBytes(12)
@@ -295,6 +251,10 @@ export function reencryptRecord(
   const plaintextBuf = Buffer.from(plaintext, 'utf8')
   plaintextBuf.fill(0)
 
+  if (newCiphertext.length === 0 || newAuthTag.length === 0) {
+    throw new Error(`Re-encryption produced empty output for ${record.evidence_id}`)
+  }
+
   return {
     ...record,
     encryptedBlob: newCiphertext,
@@ -304,5 +264,3 @@ export function reencryptRecord(
   }
 }
 
-// Silence unused import in environments without promisify usage.
-void promisify
