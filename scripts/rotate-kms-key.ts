@@ -1,4 +1,4 @@
-#!/usr/bin/env tsx
+#!/usr/bin/env node --import tsx
 /**
  * rotate-kms-key.ts — CLI for initiating and observing KEK rotation.
  *
@@ -18,6 +18,7 @@ import { kekManager, generateKekMaterial } from '../src/services/keyManager/inde
 import { evidenceDB } from '../src/services/evidence/storage.js'
 import { KeyRotationWorker, type EvidenceStore } from '../src/jobs/keyRotationWorker.js'
 import type { EvidenceRecord } from '../src/services/evidence/storage.js'
+import { pathToFileURL } from 'node:url'
 
 // ── Bootstrap version 1 from env ────────────────────────────────────────────
 
@@ -25,12 +26,12 @@ function bootstrapV1(): void {
   const secret = process.env.EVIDENCE_ENCRYPTION_KEY
   if (!secret) {
     console.error('ERROR: EVIDENCE_ENCRYPTION_KEY is not set')
-    process.exit(1)
+    throw new CliError('EVIDENCE_ENCRYPTION_KEY is not set', 1)
   }
   const keyBuf = Buffer.from(secret, 'utf-8')
   if (keyBuf.length !== 32) {
     console.error('ERROR: EVIDENCE_ENCRYPTION_KEY must be exactly 32 bytes')
-    process.exit(1)
+    throw new CliError('EVIDENCE_ENCRYPTION_KEY must be exactly 32 bytes', 1)
   }
   if (kekManager.getAllVersions().length === 0) {
     kekManager.registerVersion(keyBuf)
@@ -51,6 +52,21 @@ function makeInMemoryStore(): EvidenceStore {
     async count(): Promise<number> {
       return evidenceDB.size
     },
+  }
+}
+
+// ── Error types ──────────────────────────────────────────────────────────────
+
+/**
+ * CliError carries an explicit exit code so tests can assert on failure
+ * classification without relying on process.exit side effects.
+ */
+export class CliError extends Error {
+  readonly exitCode: number
+  constructor(message: string, exitCode = 1) {
+    super(message)
+    this.name = 'CliError'
+    this.exitCode = exitCode
   }
 }
 
@@ -85,11 +101,20 @@ function cmdRegister(args: string[]): void {
     const hex = args[keyHexIdx + 1]
     if (hex.length !== 64) {
       console.error('ERROR: --key-hex must be 64 hex characters (32 bytes)')
-      process.exit(1)
+      throw new CliError('--key-hex must be 64 hex characters (32 bytes)', 1)
+    }
+    if (!/^[0-9a-fA-F]{64}$/.test(hex)) {
+      console.error('ERROR: --key-hex must contain only hex characters')
+      throw new CliError('--key-hex must contain only hex characters', 1)
     }
     keyMaterial = Buffer.from(hex, 'hex')
   } else if (process.env.NEW_KEK_HEX) {
-    keyMaterial = Buffer.from(process.env.NEW_KEK_HEX, 'hex')
+    const envHex = process.env.NEW_KEK_HEX
+    if (!/^[0-9a-fA-F]{64}$/.test(envHex)) {
+      console.error('ERROR: NEW_KEK_HEX must be 64 hex characters')
+      throw new CliError('NEW_KEK_HEX must be 64 hex characters', 1)
+    }
+    keyMaterial = Buffer.from(envHex, 'hex')
   } else {
     // Generate a new random key
     keyMaterial = generateKekMaterial()
@@ -112,15 +137,23 @@ function cmdApprove(args: string[]): void {
 
   if (versionIdx === -1 || !args[versionIdx + 1]) {
     console.error('ERROR: --version <n> is required')
-    process.exit(1)
+    throw new CliError('--version <n> is required', 1)
   }
   if (approverIdx === -1 || !args[approverIdx + 1]) {
     console.error('ERROR: --approver <id> is required')
-    process.exit(1)
+    throw new CliError('--approver <id> is required', 1)
   }
 
   const version = parseInt(args[versionIdx + 1], 10)
+  if (!Number.isInteger(version) || version < 1) {
+    console.error('ERROR: --version must be a positive integer')
+    throw new CliError('--version must be a positive integer', 1)
+  }
   const approver = args[approverIdx + 1]
+  if (approver.trim().length === 0) {
+    console.error('ERROR: --approver must be a non-empty identifier')
+    throw new CliError('--approver must be a non-empty identifier', 1)
+  }
 
   kekManager.approveActivation(version, approver)
   const approvals = kekManager.getPendingApprovals(version)
@@ -132,9 +165,13 @@ function cmdActivate(args: string[]): void {
   const versionIdx = args.indexOf('--version')
   if (versionIdx === -1 || !args[versionIdx + 1]) {
     console.error('ERROR: --version <n> is required')
-    process.exit(1)
+    throw new CliError('--version <n> is required', 1)
   }
   const version = parseInt(args[versionIdx + 1], 10)
+  if (!Number.isInteger(version) || version < 1) {
+    console.error('ERROR: --version must be a positive integer')
+    throw new CliError('--version must be a positive integer', 1)
+  }
   kekManager.activateVersion(version)
   console.log(`KEK version ${version} is now active`)
 }
@@ -144,6 +181,10 @@ async function cmdRotate(args: string[]): Promise<void> {
 
   const batchSizeIdx = args.indexOf('--batch-size')
   const batchSize = batchSizeIdx !== -1 ? parseInt(args[batchSizeIdx + 1], 10) : 100
+  if (!Number.isInteger(batchSize) || batchSize < 1) {
+    console.error('ERROR: --batch-size must be a positive integer')
+    throw new CliError('--batch-size must be a positive integer', 1)
+  }
   const dryRun = args.includes('--dry-run')
 
   const current = kekManager.getCurrentKek()
@@ -186,6 +227,10 @@ async function cmdRotate(args: string[]): Promise<void> {
 
     const result = await worker.run(oldKek, current, controller.signal)
     console.log(`\n  Done: ${result.reencrypted} re-encrypted, ${result.skipped} skipped, ${result.failed} failed`)
+
+    if (result.failed > 0 && result.reencrypted === 0) {
+      throw new CliError(`Rotation of v${oldKek.version} failed with no progress (${result.failed} failures)`, 2)
+    }
 
     if (result.interrupted) {
       console.log('  Rotation interrupted. Re-run to continue.')
@@ -238,11 +283,70 @@ Environment:
   EVIDENCE_ENCRYPTION_KEY   Current 32-byte key (bootstraps v1)
   NEW_KEK_HEX               64-char hex for new KEK (used by register)
 `)
-      process.exit(1)
+      throw new CliError('Unknown or missing command', 1)
   }
 }
 
-main().catch((err) => {
-  console.error('Fatal:', err instanceof Error ? err.message : err)
-  process.exit(1)
-})
+/**
+ * runCli is exported so tests can drive the CLI deterministically without
+ * spawning a subprocess or mutating process.exit. It returns the exit code
+ * instead of terminating the process, and never throws.
+ */
+export async function runCli(argv: string[]): Promise<number> {
+  const [, , command, ...args] = argv
+  try {
+    switch (command) {
+      case 'status':
+        cmdStatus()
+        break
+      case 'register':
+        cmdRegister(args)
+        break
+      case 'approve':
+        cmdApprove(args)
+        break
+      case 'activate':
+        cmdActivate(args)
+        break
+      case 'rotate':
+        await cmdRotate(args)
+        break
+      default:
+        console.log(`
+KMS Key Rotation CLI
+
+Commands:
+  status                              Show current KEK versions and audit log
+  register [--key-hex <hex>]          Register a new KEK version
+  approve --version <n> --approver <id>  Record dual-control approval
+  activate --version <n>              Activate a registered KEK (requires 2 approvals)
+  rotate [--batch-size <n>] [--dry-run]  Re-encrypt all evidence records
+
+Environment:
+  EVIDENCE_ENCRYPTION_KEY   Current 32-byte key (bootstraps v1)
+  NEW_KEK_HEX               64-char hex for new KEK (used by register)
+`)
+        return 1
+    }
+    return 0
+  } catch (err) {
+    if (err instanceof CliError) {
+      console.error('Fatal:', err.message)
+      return err.exitCode
+    }
+    console.error('Fatal:', err instanceof Error ? err.message : err)
+    return 1
+  }
+}
+
+// Only execute when invoked directly (not when imported by tests).
+const invokedDirectly =
+  typeof process !== 'undefined' &&
+  process.argv[1] !== undefined &&
+  import.meta.url === pathToFileURL(process.argv[1]).href
+
+if (invokedDirectly) {
+  runCli(process.argv).then((code) => {
+    process.exitCode = code
+  })
+}

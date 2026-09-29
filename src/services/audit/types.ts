@@ -8,6 +8,7 @@ export enum AuditAction {
   REVOKE_API_KEY = 'REVOKE_API_KEY',
   CREATE_API_KEY = 'CREATE_API_KEY',
   ROTATE_API_KEY = 'ROTATE_API_KEY',
+  ROTATE_SIGNING_KEY = 'ROTATE_SIGNING_KEY',
   DELETE_USER = 'DELETE_USER',
   DISPUTE_SUBMITTED = 'DISPUTE_SUBMITTED',
   DISPUTE_MARKED_UNDER_REVIEW = 'DISPUTE_MARKED_UNDER_REVIEW',
@@ -35,7 +36,23 @@ export enum AuditAction {
   POLICY_RULE_DELETED = 'POLICY_RULE_DELETED',
   ROTATE_WEBHOOK_SECRET = 'ROTATE_WEBHOOK_SECRET',
   REVOKE_WEBHOOK_SECRET = 'REVOKE_WEBHOOK_SECRET',
+  LIST_FAILED_EVENTS = 'LIST_FAILED_EVENTS',
+  REPLAY_EVENT = 'REPLAY_EVENT',
+  REPLAY_REQUEST = 'REPLAY_REQUEST',
+  REPLAY_WEBHOOK = 'REPLAY_WEBHOOK',
+  RELOAD_CONFIG = 'RELOAD_CONFIG',
+  LIST_OUTBOX_QUARANTINE = 'LIST_OUTBOX_QUARANTINE',
+  OUTBOX_REINJECT = 'OUTBOX_REINJECT',
+  OUTBOX_PAUSE = 'OUTBOX_PAUSE',
+  OUTBOX_RESUME = 'OUTBOX_RESUME',
+  SET_RATE_LIMIT_OVERRIDE = 'SET_RATE_LIMIT_OVERRIDE',
+  REMOVE_RATE_LIMIT_OVERRIDE = 'REMOVE_RATE_LIMIT_OVERRIDE',
+  UPDATE_SETTINGS = 'UPDATE_SETTINGS',
+  PURGE_CACHE = 'PURGE_CACHE',
+  RESET_CACHE = 'RESET_CACHE',
+  CHAIN_REPAIR_REQUESTED = 'CHAIN_REPAIR_REQUESTED',
 }
+
 
 export type AuditStatus = 'success' | 'failure'
 
@@ -50,6 +67,9 @@ export interface AuditLogInput {
   ipAddress?: string
   errorMessage?: string
   tenantId: string
+  requestId?: string
+  /** Optional timestamp override — used in tests to simulate historical entries. */
+  occurredAt?: string
 }
 
 export interface AuditLogFilters {
@@ -84,6 +104,7 @@ export interface AuditLogEntry {
   ipAddress?: string
   status: AuditStatus
   errorMessage?: string
+  requestId?: string
   tenantId: string
   /** Sequence number for deterministic chain ordering */
   seq?: number
@@ -99,11 +120,27 @@ export interface AuditLogEntry {
 export interface ChainVerificationResult {
   valid: boolean
   rowsChecked: number
+  /** Highest sequence number examined during the run */
+  lastCheckedSeq?: number
   firstViolationSeq?: number
   firstViolationId?: string
   violationCount: number
   violations: ChainViolation[]
   checkedAt: string
+}
+
+export type AuditChainVerificationStatusValue = 'valid' | 'break_detected' | 'never_run'
+
+/**
+ * Durable verifier state exposed to operators via the chain-status endpoint.
+ */
+export interface AuditChainVerificationState {
+  lastVerifiedHeight: number
+  verifiedAt: string | null
+  status: AuditChainVerificationStatusValue
+  firstBreakSeq?: number | null
+  violationCount?: number
+  rowsChecked?: number
 }
 
 /**
@@ -117,4 +154,39 @@ export interface ChainViolation {
   expectedRowHash: string
   actualRowHash: string | null
   type: 'prev_hash_mismatch' | 'row_hash_mismatch' | 'missing_row' | 'deleted_row'
+}
+
+/** Explicit operator authorization required to request a non-destructive repair. */
+export interface ChainRepairAuthorization {
+  operatorId: string
+  approvedBy: string
+  authorizationRef: string
+  reason: string
+}
+
+/** Evidence marker appended to the chain instead of rewriting historical rows. */
+export interface ChainRepairMarker {
+  marker: AuditLogEntry
+  authorization: ChainRepairAuthorization
+}
+
+/**
+ * Single tenant request count entry in top talkers report
+ */
+export interface TopTalkerEntry {
+  tenantId: string
+  requestCount: number
+  percentage: number
+  lastRequestAt?: string
+}
+
+/**
+ * Top talkers report aggregated over a time window (default 1 hour)
+ */
+export interface TopTalkersReport {
+  windowStart: string
+  windowEnd: string
+  windowMinutes: number
+  totalRequests: number
+  topTalkers: TopTalkerEntry[]
 }
