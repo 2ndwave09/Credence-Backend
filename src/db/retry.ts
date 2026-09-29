@@ -55,6 +55,12 @@ export const NON_RETRYABLE_ERROR_CODES = {
   UNDEFINED_COLUMN: '42703',
   /** Undefined table */
   UNDEFINED_TABLE: '42P01',
+  /** Insufficient privilege (Permission failure) */
+  INSUFFICIENT_PRIVILEGE: '42501',
+  /** Invalid authorization specification */
+  INVALID_AUTHORIZATION_SPECIFICATION: '28000',
+  /** Invalid password */
+  INVALID_PASSWORD: '28P01',
 } as const
 
 /**
@@ -71,6 +77,8 @@ export interface RetryOptions {
   operationName?: string
   /** Enable debug logging of retry attempts (default: false) */
   debugLogging?: boolean
+  /** Optional custom predicate to determine if an error is retryable */
+  isRetryable?: (error: unknown) => boolean
 }
 
 /**
@@ -202,20 +210,40 @@ export function isRetryableError(error: unknown): boolean {
 }
 
 /**
+ * Sanitizes error messages by redacting credentials, connection strings, and tokens
+ * to ensure sensitive operational data is never exposed in logs or errors.
+ */
+export function sanitizeErrorMessage(message: string): string {
+  if (!message || typeof message !== 'string') return ''
+  return message
+    .replace(/(postgres(?:ql)?:\/\/[^:]+:)[^@]+(@)/gi, '$1***$2')
+    .replace(/(password|secret|token|api_?key|authorization)[=:\s]+[^\s,;]+/gi, '$1=***')
+}
+
+/**
  * Calculates exponential backoff delay with full jitter.
  * 
  * Formula: delay = random(0, min(maxBackoffMs, initialBackoffMs * 2^attempt))
  * 
  * Full jitter prevents thundering herd problems where many clients
  * retry simultaneously after a transient failure.
+ * Boundary-safe: protects against negative, NaN, non-finite, and overflow values.
  */
 export function calculateBackoffMs(
   attempt: number,
   initialBackoffMs: number,
   maxBackoffMs: number
 ): number {
-  const exponentialDelay = initialBackoffMs * Math.pow(2, attempt)
-  const cappedDelay = Math.min(maxBackoffMs, exponentialDelay)
+  const safeAttempt = Number.isFinite(attempt) ? Math.max(0, Math.floor(attempt)) : 0
+  const safeInitial = Number.isFinite(initialBackoffMs) ? Math.max(0, initialBackoffMs) : 50
+  const safeMax = Number.isFinite(maxBackoffMs) ? Math.max(safeInitial, maxBackoffMs) : Math.max(safeInitial, 1000)
+
+  // Guard against exponential overflow when attempt is large (e.g., attempt >= 31)
+  const exponentialMultiplier = safeAttempt >= 31 ? Number.MAX_SAFE_INTEGER : Math.pow(2, safeAttempt)
+  const exponentialDelay = safeInitial * exponentialMultiplier
+  const cappedDelay = Math.min(safeMax, exponentialDelay)
+
+  if (cappedDelay <= 0) return 0
   // Full jitter: random value between 0 and cappedDelay
   return Math.floor(Math.random() * cappedDelay)
 }
@@ -230,11 +258,20 @@ function sleep(ms: number): Promise<void> {
 /**
  * Maps a raw error to a machine-readable `conflictCode` for `ConflictError`.
  * Returns `undefined` for errors that are not conflict-related.
+ * Classifies concurrency conflicts, lock timeouts, and optimistic lock / stale states.
  */
 export function classifyConflict(error: unknown): ConflictRetryInfo['conflictCode'] | undefined {
   if (!error || typeof error !== 'object') return undefined
-  const pg = error as { code?: string }
-  switch (pg.code) {
+  const err = error as { code?: string; name?: string; conflictCode?: string }
+  if (
+    err.name === 'OptimisticLockError' ||
+    err.code === 'OPTIMISTIC_LOCK_CONFLICT' ||
+    err.code === 'optimistic_lock_conflict' ||
+    err.conflictCode === 'optimistic_lock'
+  ) {
+    return 'optimistic_lock'
+  }
+  switch (err.code) {
     case RETRYABLE_ERROR_CODES.SERIALIZATION_FAILURE:
     case RETRYABLE_ERROR_CODES.TRANSACTION_ROLLBACK:
     case RETRYABLE_ERROR_CODES.TRANSACTION_INTEGRITY_CONSTRAINT_VIOLATION:
@@ -290,12 +327,20 @@ export async function withRetryableTransaction<T>(
   options: RetryOptions = {}
 ): Promise<T> {
   const {
-    maxRetries = 3,
-    initialBackoffMs = 50,
-    maxBackoffMs = 1000,
+    maxRetries: rawMaxRetries = 3,
+    initialBackoffMs: rawInitialBackoffMs = 50,
+    maxBackoffMs: rawMaxBackoffMs = 1000,
     operationName = 'database operation',
     debugLogging = false,
+    isRetryable: customIsRetryable,
   } = options
+
+  // Validate and clamp input boundaries
+  const maxRetries = Number.isFinite(rawMaxRetries) ? Math.max(0, Math.floor(rawMaxRetries)) : 3
+  const initialBackoffMs = Number.isFinite(rawInitialBackoffMs) ? Math.max(0, rawInitialBackoffMs) : 50
+  const maxBackoffMs = Number.isFinite(rawMaxBackoffMs)
+    ? Math.max(initialBackoffMs, rawMaxBackoffMs)
+    : Math.max(initialBackoffMs, 1000)
 
   let lastError: Error | undefined
   let attempt = 0
@@ -303,9 +348,11 @@ export async function withRetryableTransaction<T>(
   let lastConflictCode: ConflictRetryInfo['conflictCode'] | undefined
 
   while (attempt <= maxRetries) {
-    const client = await pool.connect()
+    let client: PoolClient | undefined
 
     try {
+      // Loading state: check out client from pool and begin transaction
+      client = await pool.connect()
       await client.query('BEGIN')
       const result = await fn(client)
       await client.query('COMMIT')
@@ -321,22 +368,26 @@ export async function withRetryableTransaction<T>(
 
       return result
     } catch (error) {
-      // Always rollback on error
-      await client.query('ROLLBACK').catch(() => {
-        // Swallow rollback errors - connection may be dead
-      })
+      // Always rollback on error if client was checked out
+      if (client) {
+        await client.query('ROLLBACK').catch(() => {
+          // Swallow rollback errors - connection may be dead
+        })
+      }
 
       lastError = error instanceof Error ? error : new Error(String(error))
       lastConflictCode = classifyConflict(error) ?? lastConflictCode
 
+      const shouldRetry = customIsRetryable ? customIsRetryable(error) : isRetryableError(error)
+
       // Check if this is a retryable error
-      if (!isRetryableError(error)) {
+      if (!shouldRetry) {
         if (debugLogging) {
           logger.debug({
             message: `${operationName} failed with non-retryable error`,
             operationName,
             errorCode: (error as any)?.code,
-            errorMessage: lastError.message,
+            errorMessage: sanitizeErrorMessage(lastError.message),
           })
         }
         throw error
@@ -349,16 +400,16 @@ export async function withRetryableTransaction<T>(
           operationName,
           attempts: attempt,
           errorCode: (error as any)?.code,
-          errorMessage: lastError.message,
+          errorMessage: sanitizeErrorMessage(lastError.message),
         })
 
         // Surface a ConflictError with retry-after semantics when the failure
         // was due to a concurrency conflict (serialization failure, deadlock,
-        // or lock timeout). This allows HTTP handlers to set Retry-After and
+        // lock timeout, or optimistic lock). This allows HTTP handlers to set Retry-After and
         // return 409 rather than an opaque 500.
         if (lastConflictCode) {
           throw new ConflictError(
-            `${operationName} failed after ${attempt} retries due to concurrent conflict: ${lastError.message}`,
+            `${operationName} failed after ${attempt} retries due to concurrent conflict: ${sanitizeErrorMessage(lastError.message)}`,
             {
               retryAfterSeconds: Math.ceil(lastBackoffMs / 1000) || 1,
               attempts: attempt,
@@ -382,14 +433,16 @@ export async function withRetryableTransaction<T>(
           maxRetries,
           backoffMs: lastBackoffMs,
           errorCode: (error as any)?.code,
-          errorMessage: lastError.message,
+          errorMessage: sanitizeErrorMessage(lastError.message),
         })
       }
 
       await sleep(lastBackoffMs)
       attempt++
     } finally {
-      client.release()
+      if (client) {
+        client.release()
+      }
     }
   }
 
@@ -426,12 +479,19 @@ export async function withRetryableTransactionManager<T>(
   retryOptions: RetryOptions = {}
 ): Promise<T> {
   const {
-    maxRetries = 3,
-    initialBackoffMs = 50,
-    maxBackoffMs = 1000,
+    maxRetries: rawMaxRetries = 3,
+    initialBackoffMs: rawInitialBackoffMs = 50,
+    maxBackoffMs: rawMaxBackoffMs = 1000,
     operationName = 'database operation',
     debugLogging = false,
+    isRetryable: customIsRetryable,
   } = retryOptions
+
+  const maxRetries = Number.isFinite(rawMaxRetries) ? Math.max(0, Math.floor(rawMaxRetries)) : 3
+  const initialBackoffMs = Number.isFinite(rawInitialBackoffMs) ? Math.max(0, rawInitialBackoffMs) : 50
+  const maxBackoffMs = Number.isFinite(rawMaxBackoffMs)
+    ? Math.max(initialBackoffMs, rawMaxBackoffMs)
+    : Math.max(initialBackoffMs, 1000)
 
   let lastError: Error | undefined
   let attempt = 0
@@ -456,14 +516,16 @@ export async function withRetryableTransactionManager<T>(
       lastError = error instanceof Error ? error : new Error(String(error))
       lastConflictCode = classifyConflict(error) ?? lastConflictCode
 
+      const shouldRetry = customIsRetryable ? customIsRetryable(error) : isRetryableError(error)
+
       // Check if this is a retryable error
-      if (!isRetryableError(error)) {
+      if (!shouldRetry) {
         if (debugLogging) {
           logger.debug({
             message: `${operationName} failed with non-retryable error`,
             operationName,
             errorCode: (error as any)?.code,
-            errorMessage: lastError.message,
+            errorMessage: sanitizeErrorMessage(lastError.message),
           })
         }
         throw error
@@ -476,14 +538,14 @@ export async function withRetryableTransactionManager<T>(
           operationName,
           attempts: attempt,
           errorCode: (error as any)?.code,
-          errorMessage: lastError.message,
+          errorMessage: sanitizeErrorMessage(lastError.message),
         })
 
         // Surface a ConflictError with retry-after semantics when exhausted
         // due to a concurrency conflict.
         if (lastConflictCode) {
           throw new ConflictError(
-            `${operationName} failed after ${attempt} retries due to concurrent conflict: ${lastError.message}`,
+            `${operationName} failed after ${attempt} retries due to concurrent conflict: ${sanitizeErrorMessage(lastError.message)}`,
             {
               retryAfterSeconds: Math.ceil(lastBackoffMs / 1000) || 1,
               attempts: attempt,
@@ -507,7 +569,7 @@ export async function withRetryableTransactionManager<T>(
           maxRetries,
           backoffMs: lastBackoffMs,
           errorCode: (error as any)?.code,
-          errorMessage: lastError.message,
+          errorMessage: sanitizeErrorMessage(lastError.message),
         })
       }
 
