@@ -126,7 +126,7 @@ const CREATE_TABLE_STATEMENTS = [
   END;
   $$;
   `,
-  `CREATE TRIGGER trg_org_members_updated_at BEFORE UPDATE ON org_members FOR EACH ROW EXECUTE FUNCTION set_updated_at();`,
+  `CREATE OR REPLACE TRIGGER trg_org_members_updated_at BEFORE UPDATE ON org_members FOR EACH ROW EXECUTE FUNCTION set_updated_at();`,
   `
   CREATE TABLE IF NOT EXISTS report_jobs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -180,6 +180,7 @@ const CREATE_TABLE_STATEMENTS = [
     request_hash TEXT NOT NULL,
     response_code INTEGER NOT NULL,
     response_body JSONB NOT NULL,
+    response_headers JSONB,
     ttl_seconds INTEGER NOT NULL DEFAULT 86400,
     expires_at TIMESTAMPTZ NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -215,10 +216,13 @@ const CREATE_TABLE_STATEMENTS = [
     completed_at TIMESTAMPTZ,
     expires_at TIMESTAMPTZ NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (job_key, expires_at)
+    -- One row per job_key. This is what makes the ON CONFLICT (job_key) claim in
+    -- jobs/notificationIdempotency.ts atomic; a composite unique key would both
+    -- fail ON CONFLICT inference and let two rows exist for the same job.
+    UNIQUE (job_key)
   )
   `,
-  `CREATE INDEX IF NOT EXISTS idempotent_job_attempts_job_key_idx ON idempotent_job_attempts (job_key, expires_at)`,
+  `CREATE INDEX IF NOT EXISTS idempotent_job_attempts_expires_at_idx ON idempotent_job_attempts (expires_at)`,
   `CREATE INDEX IF NOT EXISTS bonds_identity_address_idx ON bonds (identity_address)`,
   `CREATE INDEX IF NOT EXISTS attestations_subject_address_idx ON attestations (subject_address)`,
   `CREATE INDEX IF NOT EXISTS attestations_bond_id_idx ON attestations (bond_id)`,
@@ -227,10 +231,13 @@ const CREATE_TABLE_STATEMENTS = [
   `CREATE INDEX IF NOT EXISTS audit_logs_actor_time_idx ON audit_logs (actor_id, occurred_at DESC)`,
   `CREATE INDEX IF NOT EXISTS audit_logs_resource_time_idx ON audit_logs (resource_id, occurred_at DESC)`,
   `CREATE INDEX IF NOT EXISTS audit_logs_time_idx ON audit_logs (occurred_at DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_audit_logs_occurred_at_tenant_id ON audit_logs (occurred_at DESC, tenant_id)`,
   `CREATE INDEX IF NOT EXISTS settlements_bond_id_idx ON settlements (bond_id)`,
   `CREATE INDEX IF NOT EXISTS settlements_status_idx ON settlements (status)`,
   `CREATE INDEX IF NOT EXISTS settlements_settled_at_idx ON settlements (settled_at DESC)`,
   `CREATE INDEX IF NOT EXISTS settlements_transaction_hash_idx ON settlements (transaction_hash)`,
+  OUTBOX_TABLE_SCHEMA,
+  ...OUTBOX_INDEXES,
 ] as const;
 
 const DROP_TABLE_STATEMENTS = [
@@ -250,6 +257,7 @@ const DROP_TABLE_STATEMENTS = [
 ] as const;
 
 export async function createSchema(db: Queryable): Promise<void> {
+  // Keep each DDL step safe to repeat so callers can recover after a partial failure.
   for (const statement of CREATE_TABLE_STATEMENTS) {
     await db.query(statement);
   }
@@ -257,7 +265,7 @@ export async function createSchema(db: Queryable): Promise<void> {
 
 export async function resetDatabase(db: Queryable): Promise<void> {
   await db.query(
-    "TRUNCATE TABLE settlements, report_jobs, pg_stat_activity_snapshots, audit_logs, score_history, slash_events, attestations, bonds, identities, org_members RESTART IDENTITY CASCADE",
+    "TRUNCATE TABLE event_outbox, settlements, report_jobs, pg_stat_activity_snapshots, audit_logs, score_history, slash_events, attestations, bonds, identities, org_members RESTART IDENTITY CASCADE",
   );
 }
 

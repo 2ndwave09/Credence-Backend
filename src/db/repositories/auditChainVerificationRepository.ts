@@ -1,5 +1,6 @@
 import type { Queryable } from './queryable.js'
 import type { AuditChainVerificationState } from '../../services/audit/types.js'
+import { getTenantId } from '../../utils/tenantContext.js'
 
 export interface AuditChainVerificationRepository {
   getStatus(): Promise<AuditChainVerificationState | null>
@@ -35,6 +36,10 @@ export class PostgresAuditChainVerificationRepository implements AuditChainVerif
   constructor(private readonly db: Queryable) {}
 
   async getStatus(): Promise<AuditChainVerificationState | null> {
+    const tenantId = getTenantId()
+    if (!tenantId) {
+      throw new Error('Missing tenant context')
+    }
     const result = await this.db.query<StatusRow>(
       `
       SELECT
@@ -45,8 +50,9 @@ export class PostgresAuditChainVerificationRepository implements AuditChainVerif
         violation_count,
         rows_checked
       FROM audit_chain_verification_status
-      WHERE id = 'default'
+      WHERE id = $1
       `,
+      [tenantId],
     )
 
     if (result.rows.length === 0) {
@@ -58,18 +64,30 @@ export class PostgresAuditChainVerificationRepository implements AuditChainVerif
   }
 
   async saveStatus(state: AuditChainVerificationState): Promise<AuditChainVerificationState> {
+    const tenantId = getTenantId()
+    if (!tenantId) {
+      throw new Error('Missing tenant context')
+    }
     const result = await this.db.query<StatusRow>(
       `
-      UPDATE audit_chain_verification_status
-      SET
-        last_verified_height = $1,
-        verified_at = $2,
-        status = $3,
-        first_break_seq = $4,
-        violation_count = $5,
-        rows_checked = $6,
+      INSERT INTO audit_chain_verification_status (
+        id,
+        last_verified_height,
+        verified_at,
+        status,
+        first_break_seq,
+        violation_count,
+        rows_checked,
+        updated_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+      ON CONFLICT (id) DO UPDATE SET
+        last_verified_height = EXCLUDED.last_verified_height,
+        verified_at = EXCLUDED.verified_at,
+        status = EXCLUDED.status,
+        first_break_seq = EXCLUDED.first_break_seq,
+        violation_count = EXCLUDED.violation_count,
+        rows_checked = EXCLUDED.rows_checked,
         updated_at = NOW()
-      WHERE id = 'default'
       RETURNING
         last_verified_height,
         verified_at,
@@ -79,6 +97,7 @@ export class PostgresAuditChainVerificationRepository implements AuditChainVerif
         rows_checked
       `,
       [
+        tenantId,
         state.lastVerifiedHeight,
         state.verifiedAt,
         state.status,
@@ -92,6 +111,10 @@ export class PostgresAuditChainVerificationRepository implements AuditChainVerif
   }
 
   async clear(): Promise<void> {
+    const tenantId = getTenantId()
+    if (!tenantId) {
+      throw new Error('Missing tenant context')
+    }
     await this.db.query(
       `
       UPDATE audit_chain_verification_status
@@ -103,25 +126,39 @@ export class PostgresAuditChainVerificationRepository implements AuditChainVerif
         violation_count = 0,
         rows_checked = 0,
         updated_at = NOW()
-      WHERE id = 'default'
+      WHERE id = $1
       `,
+      [tenantId],
     )
   }
 }
 
 export class InMemoryAuditChainVerificationRepository implements AuditChainVerificationRepository {
-  private state: AuditChainVerificationState | null = null
+  private states = new Map<string, AuditChainVerificationState>()
 
   async getStatus(): Promise<AuditChainVerificationState | null> {
-    return this.state ? { ...this.state } : null
+    const tenantId = getTenantId()
+    if (!tenantId) {
+      throw new Error('Missing tenant context')
+    }
+    const state = this.states.get(tenantId)
+    return state ? { ...state } : null
   }
 
   async saveStatus(state: AuditChainVerificationState): Promise<AuditChainVerificationState> {
-    this.state = { ...state }
-    return { ...this.state }
+    const tenantId = getTenantId()
+    if (!tenantId) {
+      throw new Error('Missing tenant context')
+    }
+    this.states.set(tenantId, { ...state })
+    return { ...this.states.get(tenantId)! }
   }
 
   async clear(): Promise<void> {
-    this.state = null
+    const tenantId = getTenantId()
+    if (!tenantId) {
+      throw new Error('Missing tenant context')
+    }
+    this.states.delete(tenantId)
   }
 }

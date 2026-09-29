@@ -172,7 +172,7 @@ Content-Type: application/json
 ## 4. Webhook Signing Secrets
 
 ### Purpose & Architecture
-Used to sign payloads sent to external subscribers via `X-Credence-Signature` HMAC headers so receiving servers can verify the authenticity of the webhook event. Handled by [WebhookRotationService](file:///c:/Users/DELL/Documents/GitHub/Credence-Backend/src/services/webhooks/rotationService.ts).
+Used to sign payloads sent to external subscribers via `X-Webhook-Signature` HMAC headers so receiving servers can verify the authenticity of the webhook event. Handled by [WebhookRotationService](../src/services/webhooks/rotationService.ts). For full operator procedures, see **[Webhook Signature Operator Guide](WEBHOOK_SIGNING.md)**.
 
 ### Where They Live
 - Stored plain-text (or encrypted) in the database in the webhooks subscription table.
@@ -197,9 +197,12 @@ Content-Type: application/json
 *Response (200 OK):*
 ```json
 {
-  "webhookId": "wh_9876543210abcdef",
-  "newSecret": "d9f8e7d6c5b4a392817263544536271809a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4",
-  "rotatedAt": "2026-07-24T00:30:00.000Z",
-  "previousSecretExpiresAt": "2026-07-25T00:30:00.000Z"
+  "success": true,
+  "data": {
+    "webhookId": "wh_9876543210abcdef",
+    "newSecret": "d9f8e7d6c5b4a392817263544536271809a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4",
+    "rotatedAt": "2026-07-24T00:30:00.000Z",
+    "previousSecretExpiresAt": "2026-07-25T00:30:00.000Z"
+  }
 }
 ```
