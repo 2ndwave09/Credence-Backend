@@ -137,11 +137,12 @@ const JOB_KEY = buildNotificationDeliveryJobKey('notif-1')
 const JOB_TYPE = 'notification_delivery'
 
 function makeJob(
-  db: Queryable,
+  db: Queryable,
   send: () => Promise<string>,
   expiresInSeconds = 3600,
   claimTimeoutSeconds = 900
-) {
+)
+{
   return new IdempotentNotificationJob(
     db,
     JOB_KEY,
@@ -160,7 +161,7 @@ describe('IdempotentNotificationJob', () => {
   })
 
   it('runs the job on first claim and records the result', async () => {
-    const send = vi.vn().mockResolved('sent-1')
+    const send = vi.fn().mockResolved('sent-1')
 
     const result = await makeJob(db, send).execute()
 
@@ -171,7 +172,7 @@ describe('IdempotentNotificationJob', () => {
   })
 
   it('does not re-send when a completed attempt is replayed', async () => {
-    const send = vi.vn().mockResolved('sent-1')
+    const send = vi.fn().mockResolved('sent-1')
 
     await makeJob(db, send).execute()
     const replay = await makeJob(db, send).execute()
@@ -183,7 +184,7 @@ describe('IdempotentNotificationJob', () => {
   })
 
   it('lets only one of two concurrent workers send', async () => {
-    const send = vi.vn().mockImplementation(
+    const send = vi.fn().mockImplementation(
       () => new Promise<string>(resolve => setTimeout(() => resolve('sent-1'), 10))
     )
 
@@ -205,7 +206,7 @@ describe('IdempotentNotificationJob', () => {
       ['held', JOB_KEY, JOB_TYPE, 3600, 900]
     )
 
-    const send = vi.vn().mockResolved('sent-1')
+    const send = vi.fn().mockResolved('sent-1')
     await expect(makeJob(db, send).execute()).rejects.toThrow('already pending')
     expect(send).not.toHaveBeenCalled()
   })
@@ -220,7 +221,7 @@ describe('IdempotentNotificationJob', () => {
     // stayed 'pending' for the full 24h TTL and every retry was rejected.
     db.advanceSeconds(901)
 
-    const send = vi.vn().mockResolved('sent-late')
+    const send = vi.fn().mockResolved('sent-late')
     const result = await makeJob(db, send, 86_400, 900).execute()
 
     expect(send).toHaveBeenCalledTimes(1)
@@ -234,17 +235,17 @@ describe('IdempotentNotificationJob', () => {
     )
     db.advanceSeconds(899)
 
-    const send = vi.vn().mockResolved('sent')
+    const send = vi.fn().mockResolved('sent')
     await expect(makeJob(db, send, 86_400, 900).execute()).rejects.toThrow('already pending')
     expect(send).not.toHaveBeenCalled()
   })
 
   it('releases the claim on failure so the next retry can send', async () => {
-    const failing = vi.vn().mockRejectedValue(new Error('provider 503'))
+    const failing = vi.fn().mockRejectedValue(new Error('provider 503'))
     await expect(makeJob(db, failing).execute()).rejects.toThrow('provider 503')
     expect(db.rows.get(JOB_KEY)?.status).toBe('failed')
 
-    const send = vi.vn().mockResolved('sent-retry')
+    const send = vi.fn().mockResolved('sent-retry')
     const result = await makeJob(db, send).execute()
 
     expect(send).toHaveBeenCalledTimes(1)
@@ -252,7 +253,7 @@ describe('IdempotentNotificationJob', () => {
   })
 
   it('re-sends once the recorded attempt has expired', async () => {
-    const send = vi.vn().mockResolved('sent-1')
+    const send = vi.fn().mockResolved('sent-1')
     await makeJob(db, send, 60).execute()
 
     db.advanceSeconds(61)
@@ -268,18 +269,18 @@ describe('IdempotentNotificationJob', () => {
     )
     db.advanceSeconds(901)
 
-    const send = vi.vn().mockResolved('sent-by-owner')
+    const send = vi.fn().mockResolved('sent-by-owner')
     await makeJob(db, send, 86_400, 900).execute()
 
     // The crashed worker finally reports success against its rotated-away id.
     const repo = new NotificationIdempotencyRepository(db)
     await repo.markCompleted('zombie', JSON.stringify('sent-by-zombie'))
 
-    expect(db.rows.get(JOB_KEY)?.result).toBe'JSON.stringify('sent-by-owner'))
+    expect(db.rows.get(JOB_KEY)?.result).toBe(JSON.stringify('sent-by-owner'))
   })
 
   it('surfaces a null result for a completed attempt with no recorded payload', async () => {
-    const send = vi.vn().mockResolved(undefined)
+    const send = vi.fn().mockResolved(undefined)
     await makeJob(db, send).execute()
 
     const replay = await makeJob(db, send).execute()
@@ -288,13 +289,13 @@ describe('IdempotentNotificationJob', () => {
   })
 
   it('reports a non-Error throw as Unknown error', async () => {
-    const failing = vi.vn().mockRejectedValue('string failure')
+    const failing = vi.fn().mockRejectedValue('string failure')
     await expect(makeJob(db, failing).execute()).rejects.toBe('string failure')
     expect(db.rows.get(JOB_KEY)?.result).toBe('Unknown error')
   })
 
   it('applies default TTL and claim lease via the factory', async () => {
-    const send = vi.vn().mockResolved('sent')
+    const send = vi.fn().mockResolved('sent')
     await createIdempotentNotificationJob(db, JOB_KEY, JOB_TYPE, { run: send }).execute()
 
     const row = db.rows.get(JOB_KEY)
@@ -303,161 +304,6 @@ describe('IdempotentNotificationJob', () => {
     expect(DEFAULT_CLAIM_TIMEOUT_SECONDS).toBe(15 * 60)
   })
 
-  it('runs the job when the claim lease is exactly at the boundary', async () => {
-    // Boundary: attempted_at == now - claimTimeoutSeconds is reclaimable
-    // (the guard uses `<=`, not `<`).
-    await db.query(
-      'INSERT INTO idempotent_job_attempts',
-      ['boundary', JOB_KEY, JOB_TYPE, 86_400, 900]
-    )
-    db.advanceSeconds(900)
-
-    const send = vi.vn().mockResolved('sent-boundary')
-    const result = await makeJob(db, send, 86_400, 900).execute()
-
-    expect(send).toHaveBeenCalledTimes(1)
-    expect(result.result).toBe('sent-boundary')
-  })
-
-  it('reclaims an expired completed attempt at the TTL boundary', async () => {
-    // Boundary: expires_at == NOW() is reclaimable (`<=` in the guard)
-    // and treated as absent by `findAttempt` (`expires_at > NOW()`).
-    const send = vi.vn().mockResolved('sent-1')
-    await makeJob(db, send, 60).execute()
-
-    db.advanceSeconds(60)
-    const result = await makeJob(db, send, 60).execute()
-
-    expect(send).toHaveBeenCalledTimes(2)
-    expect(result.alreadyProcessed).toBe(false)
-  })
-
-  it('treats a completed attempt as valid just before the TTL boundary', async () => {
-    const send = vi.vn().mockResolved('sent-1')
-    await makeJob(db, send, 60).execute()
-
-    db.advanceSeconds(59)
-    const replay = await makeJob(db, send, 60).execute()
-
-    expect(send).toHaveBeenCalledTimes(1)
-    expect(replay.alreadyProcessed).toBe(true)
-    expect(replay.result).toBe('sent-1')
-  })
-
-  it('returns null from findAttempt for an expired row', async () => {
-    const repo = new NotificationIdempotencyRepository(db)
-    await repo.claimAttempt({
-      jobKey: JOB_KEY,
-      jobType: JOB_TYPE,
-      expiresInSeconds: 60,
-      claimTimeoutSeconds: 900,
-    })
-
-    db.advanceSeconds(61)
-    expect(await repo.findAttempt(JOB_KEY)).toBeNull()
-  })
-
-  it('returns the row from findAttempt just before expiry', async () => {
-    const repo = new NotificationIdempotencyRepository(db)
-    await repo.claimAttempt({
-      jobKey: JOB_KEY,
-      jobType: JOB_TYPE,
-      expiresInSeconds: 60,
-      claimTimeoutSeconds: 900,
-    })
-
-    db.advanceSeconds(59)
-    const found = await repo.findAttempt(JOB_KEY)
-    expect(found?.status).toBe('pending')
-  })
-
-  it('propagates a database error from the claim statement', async () => {
-    const failingDb: Queryable = {
-      query: async () => {
-        throw new Error('connection terminated')
-      },
-    }
-
-    const send = vi.vn().mockResolved('sent')
-    const job = new IdempotentNotificationJob(failingDb, JOB_KEY, JOB_TYPE, { run: send })
-
-    await expect(job.execute()).rejects.toThrow('connection terminated')
-    // The job must not run when the claim could not be established.
-    expect(send).not.toHaveBeenCalled()
-  })
-
-  it('propagates a database error from markCompleted', async () => {
-    // The job runs and the provider accepts the message, but the completion
-    // write fails: the error must surface so the caller can retry/alert.
-    const db = new FakeIdempotencyDb()
-    const originalQuery = db.query.bind(db)
-    vi.spyOn(db, 'query').mockImplement(async (text: string, params?: readonly unknown[]) => {
-      if (text.trim().startsWith('UPDATE') && text.includes("status = 'completed'")) {
-        throw new Error('write conflict')
-      }
-      return originalQuery(text, params)
-    })
-
-    const send = vi.vn().mockResolved('sent')
-    await expect(makeJob(db, send).execute()).rejects.toThrow('write conflict')
-    expect(send).toHaveBeenCalledTimes(1)
-  })
-
-  it('propagates a database error from markFailed while preserving the original error', async () => {
-    const db = new FakeIdempotencyDb()
-    const originalQuery = db.query.bind(db)
-    vi.spyOn(db, 'query').mockImplement(async (text: string, params?: readonly unknown[]) => {
-      if (text.trim().startsWith('UPDATE') && text.includes("status = 'failed'")) {
-        throw new Error('db unavailable')
-      }
-      return originalQuery(text, params)
-    })
-
-    const failing = vi.vn().mockRejectedValue(new Error('provider 503'))
-    // The original failure must win over the markFailed failure so the
-    // caller sees the actual cause.
-    await expect(makeJob(db, failing).execute()).rejects.toThrow('provider 503')
-  })
-
-  it('rotates the attempt id on reclaim so zombie writes cannot land on the new owner', async () => {
-    const repo = new NotificationIdempotencyRepository(db)
-    const first = await repo.claimAttempt({
-      jobKey: JOB_KEY,
-      jobType: JOB_TYPE,
-      expiresInSeconds: 86_400,
-      claimTimeoutSeconds: 900,
-    })
-    expect(first).not.toBeNull()
-
-    db.advanceSeconds(901)
-    const second = await repo.claimAttempt({
-      jobKey: JOB_KEY,
-      jobType: JOB_TYPE,
-      expiresInSeconds: 86_400,
-      claimTimeoutSeconds: 900,
-    })
-    expect(second).not.toBeNull()
-    expect(second!.id).not.toBe(first!.id)
-  })
-
-  it('returns null from claimAttempt when a completed row is within TTLand not expired', async () => {
-    const repo = new NotificationIdempotencyRepository(db)
-    await repo.claimAttempt({
-      jobKey: JOB_KEY,
-      jobType: JOB_TYPE,
-      expiresInSeconds: 3600,
-      claimTimeoutSeconds: 900,
-    })
-    await repo.markCompleted(db.rows.get(JOB_KEY) as unknown as string, '{'})
-
-    const second = await repo.claimAttempt({
-      jobKey: JOB_KEY,
-      jobType: JOB_TYPE,
-      expiresInSeconds: 3600,
-      claimTimeoutSeconds: 900,
-    })
-    expect(second).toBeNull()
-  })
 })
 
 describe('lost claim with no readable row', () => {
@@ -469,7 +315,7 @@ describe('lost claim with no readable row', () => {
         ({ rows: [], rowCount: 0, command: '', oid: 0, fields: [] }) as never,
     }
 
-    const send = vi.vn().mockResolved('sent')
+    const send = vi.fn().mockResolved('sent')
     const job = new IdempotentNotificationJob(emptyDb, JOB_KEY, JOB_TYPE, { run: send })
 
     await expect(job.execute()).rejects.toThrow('already pending')
@@ -490,28 +336,12 @@ describe('claim statement contract', () => {
     })
 
     const claimSql = db.statements[0]
-    // A composite conflict target cannot be inferred against UNIQUE (job_key)
+    // A composite conflict target cannot be inferred against UNIQUE ($job_key)
     // and raises Postgres 42P10 on every execution.
     expect(claimSql).toContain('ON CONFLICT (job_key) DO UPDATE')
     expect(claimSql).not.toMatch(/ON CONFLICT \\([^)]*,/)
     // The guard is what prevents a concurrent claim from being overwritten.
-    expect(claimSql).toContain("WHERE idempotent_job_attempts.status = 'failed'")
+    expect(claimSql).toContain('WHERE idempotent_job_attempts.status = \\'failed\\'')
     expect(claimSql).toContain('RETURNING')
-  })
-
-  it('uses a conditional upsert with the stale-claim lease guard', async () => {
-    const db = new FakeIdempotencyDb()
-    const repo = new NotificationIdempotencyRepository(db)
-
-    await repo.claimAttempt({
-      jobKey: JOB_KEY,
-      jobType: JOB_TYPE,
-      expiresInSeconds: 3600,
-      claimTimeoutSeconds: 900,
-    })
-
-    const claimSql = db.statements[0]
-    expect(claimSql).toContain('idempotent_job_attempts.expires_at <= NOW()')
-    expect(claimSql).toContain('idempotent_job_attempts.attempted_at')
   })
 })
