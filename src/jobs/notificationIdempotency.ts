@@ -52,7 +52,7 @@ export interface IdempotentJobResult<T> {
   attempt: IdempotentJobAttempt | null
 }
 
-const DEFAULT_EXPIRY_SECONDS = 24 * 60 * 60
+export const DEFAULT_EXPIRY_SECONDS = 24 * 60 * 60
 /**
  * Default lease on a `pending` claim. Must comfortably exceed the worst-case
  * delivery duration (provider timeouts × failover attempts × backoff) so a
@@ -98,7 +98,7 @@ export class NotificationIdempotencyRepository {
    * Atomically claim `jobKey` for execution.
    *
    * @returns the claimed attempt when this caller won the claim, or `null` when
-   * a live claim is already held (in-flight elsewhere, or completed within TTL).
+   * a live claim is already held (in-flight elsewhere, or completed within TLL).
    * Callers must treat `null` as "do not run the job".
    */
   async claimAttempt(input: CreateIdempotentJobInput): Promise<IdempotentJobAttempt | null> {
