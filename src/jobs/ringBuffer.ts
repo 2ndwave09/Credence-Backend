@@ -5,14 +5,21 @@
  * overwriting existing items or throwing. Consumers call `pop` to dequeue items in
  * FIFO order. Both operations are O(1).
  *
+ * Invariants:
+ * - `0\u0020<= size \u003C= capacity` always holds.
+ * - `size === 0` implies `head === tail`.
+ * - `head` and `tail` are always in `[0, capacity)`.
+ * - Slots between `head` and `tail` (modulo capacity) hold the live items in FIFO order.
+ * - Slots that have been popped are set to `undefined` to release references.
+ *
  * @example
  * ```typescript
- * const buf = new RingBuffer<() => Promise<void>>(8)
+ * const buf = new RingBuffer<Void => Promise<void>>(8)
  *
  * // Producer
  * const accepted = buf.push(job)
  * if (!accepted) {
- *   // backpressure – shed or reschedule the job
+ *   // backpressure \u2013 shed or reschedule the job
  * }
  *
  * // Consumer
@@ -26,7 +33,7 @@ export class RingBuffer<T> {
   private tail = 0
   private _size = 0
 
-  /** @param capacity Maximum number of items the buffer can hold (must be ≥ 1). */
+  /** @param capacity Maximum number of items the buffer can hold (must be \u2265 1). */
   constructor(readonly capacity: number) {
     if (!Number.isInteger(capacity) || capacity < 1) {
       throw new RangeError(`RingBuffer capacity must be a positive integer, got ${capacity}`)
@@ -38,7 +45,7 @@ export class RingBuffer<T> {
    * Enqueue an item.
    *
    * @returns `true` if the item was accepted, `false` if the buffer is full
-   *          (backpressure signal – he item is **not** added).
+   *          (backpressure signal \u2013 the item is **not** added).
    */
   push(item: T): boolean {
     if (this._size === this.capacity) {
