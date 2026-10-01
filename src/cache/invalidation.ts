@@ -319,7 +319,15 @@ export async function invalidateTenantCache(
     throw new ServiceUnavailableError('Cache backend is unavailable; tenant cache was not invalidated')
   }
 
-  const keysCleared = await cache.clearNamespace(tenantId)
+  let keysCleared: number
+  try {
+    // Tenant support tooling must not turn a backend failure into a false
+    // zero-key success. Other cache callers retain the historical best-effort
+    // behavior of clearNamespace() by leaving throwOnError disabled.
+    keysCleared = await cache.clearNamespace(tenantId, { throwOnError: true })
+  } catch {
+    throw new ServiceUnavailableError('Cache backend is unavailable; tenant cache was not invalidated')
+  }
 
   logger.info({
     message: 'Tenant cache invalidated',
