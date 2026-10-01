@@ -14,6 +14,34 @@ import { OUTBOX_LIFECYCLE_TRANSITIONS } from './transitions.js'
 /** Upper bound on the exponential backoff delay between retry attempts. */
 const MAX_BACKOFF_SECONDS = 3600
 
+/** Hard upper bound on rows returned by a single claim/fetch call. */
+const MAX_CLAIM_LIMIT = 10_000
+
+/** Hard upper bound on lease duration (seconds) to prevent effectively-infinite leases. */
+const MAX_LEASE_SECONDS = 86_400
+
+/**
+ * Clamp a caller-supplied limit to a safe positive integer.
+ * Prevents unbounded scans and negative/NaN LIMIT values reaching SQL.
+ */
+function normalizeLimit(limit: number, fallback: number = 100): number {
+  if (!Number.isFinite(limit) || limit <= 0) {
+    return fallback
+  }
+  return Math.min(Math.floor(limit), MAX_CLAIM_LIMIT)
+}
+
+/**
+ * Validate a positive integer bound. Rejects NaN, Infinity, non-integers,
+ * and values outside [min, max] so callers cannot silently pass unsafe
+ * values (e.g. negative limits that would disable LIMIT semantics).
+ */
+function assertBoundedInt(value: number, name: string, min: number, max: number): void {
+  if (!Number.isInteger(value) || value < min || value > max) {
+    throw new RangeError(`${name} must be an integer in [${min}, ${max}], received ${value}`)
+  }
+}
+
 type OutboxEventRow = {
   id: string
   aggregate_type: string
@@ -255,7 +283,14 @@ export class OutboxRepository {
 
       return result.rows.map(mapOutboxEvent)
     } catch (error) {
-      // Fallback for pg-mem (doesn't support SKIP LOCKED)
+      // Fallback for pg-mem (doesn't support SKIP LOCKED).
+      // Only fall back when the failure is specifically due to SKIP LOCKED
+      // being unsupported; re-throw anything else so real errors (connection
+      // loss, syntax errors, permission failures) are not silently masked
+      // and cannot produce an inconsistent claim result.
+      if (!isSkipLockedUnsupportedError(error)) {
+        throw error
+      }
       const result = await db.query<{
         id: string
         aggregate_type: string
@@ -320,7 +355,7 @@ export class OutboxRepository {
       `UPDATE event_outbox
        SET lease_expires_at = NOW() + ($2 || ' seconds')::interval
        WHERE consumer_id = $1 AND status = 'processing'`,
-      [consumerId, leaseSeconds.toString()]
+      [consumerId, safeLeaseSeconds.toString()]
     )
     return (result as any).rowCount ?? 0
   }
@@ -382,7 +417,7 @@ export class OutboxRepository {
        WHERE consumer_id = $1 AND status = 'processing'
        ORDER BY created_at ASC
        LIMIT $2`,
-      [consumerId, limit]
+      [consumerId, safeLimit]
     )
 
     return result.rows.map(mapOutboxEvent)
@@ -432,7 +467,11 @@ export class OutboxRepository {
 
       return result.rows.map(mapOutboxEvent)
     } catch (error) {
-      // Fallback for pg-mem
+      // Fallback for pg-mem. Only fall back for the SKIP LOCKED case; any
+      // other error must propagate so callers can retry or surface it.
+      if (!isSkipLockedUnsupportedError(error)) {
+        throw error
+      }
       const result = await db.query<{
         id: string
         aggregate_type: string
@@ -478,9 +517,13 @@ export class OutboxRepository {
     )
 
     const lagSeconds = result.rows[0]?.lag_seconds
-    return lagSeconds !== null && lagSeconds !== undefined
-      ? Number(lagSeconds)
-      : 0
+    if (lagSeconds === null || lagSeconds === undefined) {
+      return 0
+    }
+    const parsed = Number(lagSeconds)
+    // Guard against non-finite values (NaN/Infinity) so downstream lag
+    // alerting never receives a value that silently disables thresholds.
+    return Number.isFinite(parsed) ? parsed : 0
   }
 
   /**
@@ -541,6 +584,8 @@ export class OutboxRepository {
     // error) or be unbounded in length.
     const sanitizedMessage = sanitizeErrorMessage(errorMessage)
 
+    // Recovery invariant: a failed transition must be observable even when the
+    // row is concurrently claimed by another consumer (rowCount === 0).
     // Step 1: increment retry_count, set status and clear lease/consumer, clear next_attempt_at and idempotency key for now
     const upd = await db.query<{
       retry_count: number
@@ -572,6 +617,16 @@ export class OutboxRepository {
     const status = retryCount >= maxRetries ? 'dead_letter' : 'pending'
     return { status, retryCount }
   }
+
+/**
+ * Detect the specific error raised when a database (e.g. pg-mem) does not
+ * support `FOR UPDATE SKIP LOCKED`.  Any other error must be treated as a
+ * real failure so recovery paths do not mask it.
+ */
+function isSkipLockedUnsupportedError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  return /skip\s*locked/i.test(message)
+}
 
   /**
    * Get events for a specific aggregate, ordered by creation time.
@@ -612,7 +667,7 @@ export class OutboxRepository {
        WHERE aggregate_type = $1 AND aggregate_id = $2
        ORDER BY created_at DESC
        LIMIT $3`,
-      [aggregateType, aggregateId, limit]
+      [aggregateType, aggregateId, safeLimit]
     )
 
     return result.rows.map(mapOutboxEvent)
@@ -718,9 +773,9 @@ export class OutboxRepository {
       where.push(`reason = $${params.length}`)
     }
 
-    params.push(limit)
+    params.push(safeLimit)
     const limitIdx = params.length
-    params.push(offset)
+    params.push(safeOffset)
     const offsetIdx = params.length
     const whereSql = where.length > 0 ? `WHERE ${where.join(' AND ')}` : ''
 
@@ -798,9 +853,9 @@ export class OutboxRepository {
          RETURNING id
        )
        SELECT COUNT(*) as deleted_count FROM deleted`,
-      [config.publishedRetentionDays, config.failedRetentionDays]
+      [publishedRetentionDays, failedRetentionDays]
     )
-    return result.rows[0]?.deleted_count ?? 0
+    return Number(result.rows[0]?.deleted_count ?? 0)
   }
 
   /**
@@ -829,7 +884,8 @@ export class OutboxRepository {
       quarantined: 0,
     }
     for (const row of result.rows) {
-      stats[row.status] = parseInt(row.count, 10)
+      const parsed = parseInt(row.count, 10)
+      stats[row.status] = Number.isFinite(parsed) ? parsed : 0
     }
     return stats
   }
