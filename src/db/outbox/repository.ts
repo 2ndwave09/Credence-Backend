@@ -249,7 +249,14 @@ export class OutboxRepository {
 
       return result.rows.map(mapOutboxEvent)
     } catch (error) {
-      // Fallback for pg-mem (doesn't support SKIP LOCKED)
+      // Fallback for pg-mem (doesn't support SKIP LOCKED).
+      // Only fall back when the failure is specifically due to SKIP LOCKED
+      // being unsupported; re-throw anything else so real errors (connection
+      // loss, syntax errors, permission failures) are not silently masked
+      // and cannot produce an inconsistent claim result.
+      if (!isSkipLockedUnsupportedError(error)) {
+        throw error
+      }
       const result = await db.query<{
         id: string
         aggregate_type: string
@@ -420,7 +427,11 @@ export class OutboxRepository {
 
       return result.rows.map(mapOutboxEvent)
     } catch (error) {
-      // Fallback for pg-mem
+      // Fallback for pg-mem. Only fall back for the SKIP LOCKED case; any
+      // other error must propagate so callers can retry or surface it.
+      if (!isSkipLockedUnsupportedError(error)) {
+        throw error
+      }
       const result = await db.query<{
         id: string
         aggregate_type: string
@@ -464,9 +475,13 @@ export class OutboxRepository {
     )
 
     const lagSeconds = result.rows[0]?.lag_seconds
-    return lagSeconds !== null && lagSeconds !== undefined
-      ? Number(lagSeconds)
-      : 0
+    if (lagSeconds === null || lagSeconds === undefined) {
+      return 0
+    }
+    const parsed = Number(lagSeconds)
+    // Guard against non-finite values (NaN/Infinity) so downstream lag
+    // alerting never receives a value that silently disables thresholds.
+    return Number.isFinite(parsed) ? parsed : 0
   }
 
   /**
@@ -556,6 +571,16 @@ export class OutboxRepository {
     const status = retryCount >= maxRetries ? 'dead_letter' : 'pending'
     return { status, retryCount }
   }
+
+/**
+ * Detect the specific error raised when a database (e.g. pg-mem) does not
+ * support `FOR UPDATE SKIP LOCKED`.  Any other error must be treated as a
+ * real failure so recovery paths do not mask it.
+ */
+function isSkipLockedUnsupportedError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  return /skip\s*locked/i.test(message)
+}
 
   /**
    * Get events for a specific aggregate, ordered by creation time.
@@ -778,7 +803,7 @@ export class OutboxRepository {
        SELECT COUNT(*) as deleted_count FROM deleted`,
       [publishedRetentionDays, failedRetentionDays]
     )
-    return result.rows[0]?.deleted_count ?? 0
+    return Number(result.rows[0]?.deleted_count ?? 0)
   }
 
   /**
@@ -805,7 +830,8 @@ export class OutboxRepository {
       dead_letter: 0,
     }
     for (const row of result.rows) {
-      stats[row.status] = parseInt(row.count, 10)
+      const parsed = parseInt(row.count, 10)
+      stats[row.status] = Number.isFinite(parsed) ? parsed : 0
     }
     return stats
   }
