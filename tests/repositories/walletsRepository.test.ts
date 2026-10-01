@@ -18,6 +18,8 @@ import type { Pool, PoolClient } from 'pg';
 import {
   WalletsRepository,
   InsufficientBalanceError,
+  AmountScaleError,
+  AmountOverflowError,
 } from '../../src/db/repositories/walletsRepository.js';
 
 // ---------------------------------------------------------------------------
@@ -61,28 +63,52 @@ interface MockWalletRow {
   updated_at: Date;
 }
 
+interface MockPoolOptions {
+  lockTimeoutFailures?: number;
+  ledgerFailures?: number;
+}
+
 /**
  * Build a mock Pool whose connected clients intercept the exact SQL patterns
  * emitted by WalletsRepository.debit() and credit().
  */
-function makeMockPool(walletStore: Map<string, MockWalletRow>): Pool {
+function makeMockPool(
+  walletStore: Map<string, MockWalletRow>,
+  options: MockPoolOptions = {},
+): Pool {
+  let remainingLockTimeoutFailures = options.lockTimeoutFailures ?? 0;
+  let remainingLedgerFailures = options.ledgerFailures ?? 0;
+
   const makeClient = (): PoolClient => {
+    let transactionSnapshot: Map<string, MockWalletRow> | undefined;
     const query = vi.fn().mockImplementation(
       async (text: string | { text: string }, values?: unknown[]) => {
         const sql = (typeof text === 'string' ? text : text.text).trim();
 
         // Transaction lifecycle + lock-timeout commands
-        if (
-          /^BEGIN/i.test(sql) ||
-          /^SET LOCAL/i.test(sql) ||
-          /^COMMIT/i.test(sql) ||
-          /^ROLLBACK/i.test(sql)
-        ) {
+        if (/^BEGIN/i.test(sql)) {
+          transactionSnapshot = new Map<string, MockWalletRow>(
+            [...walletStore.entries()].map(([id, row]) => [id, { ...row }]),
+          );
+          return { rows: [], rowCount: 0 };
+        }
+        if (/^ROLLBACK/i.test(sql)) {
+          walletStore.clear();
+          for (const [id, row] of transactionSnapshot ?? []) {
+            walletStore.set(id, { ...row });
+          }
+          return { rows: [], rowCount: 0 };
+        }
+        if (/^COMMIT/i.test(sql) || /^SET LOCAL/i.test(sql)) {
           return { rows: [], rowCount: 0 };
         }
 
         // SELECT … FOR UPDATE (lock the row)
         if (/SELECT.*FROM wallets/is.test(sql) && /FOR UPDATE/i.test(sql)) {
+          if (remainingLockTimeoutFailures > 0) {
+            remainingLockTimeoutFailures -= 1;
+            throw Object.assign(new Error('lock timeout'), { code: '55P03' });
+          }
           const id = values![0] as string;
           const row = walletStore.get(id);
           return { rows: row ? [{ ...row }] : [], rowCount: row ? 1 : 0 };
@@ -94,7 +120,7 @@ function makeMockPool(walletStore: Map<string, MockWalletRow>): Pool {
           const row = walletStore.get(id);
           if (!row) return { rows: [], rowCount: 0 };
 
-          const isDebit = /balance::NUMERIC - /i.test(sql);
+          const isDebit = /balance\s*-\s*\$2/i.test(sql);
           const newBalance = isDebit
             ? decimalSub(row.balance, amount)
             : decimalAdd(row.balance, amount);
@@ -106,6 +132,10 @@ function makeMockPool(walletStore: Map<string, MockWalletRow>): Pool {
 
         // INSERT INTO wallet_transactions — upstream ledger recording added in the same tx
         if (/INSERT INTO wallet_transactions/i.test(sql)) {
+          if (remainingLedgerFailures > 0) {
+            remainingLedgerFailures -= 1;
+            throw new Error('ledger write failed');
+          }
           const [walletId, type, amount, previousBalance, newBalance] = values as string[];
           return {
             rows: [{
@@ -195,6 +225,40 @@ describe('WalletsRepository', () => {
       await expect(repo.debit('missing-id', '1')).rejects.toThrow('not found');
     });
 
+    it('retries a transient lock timeout in a fresh transaction', async () => {
+      seedWallet(store, { id: 'w1', balance: '100' });
+      pool = makeMockPool(store, { lockTimeoutFailures: 1 });
+      repo = new WalletsRepository({} as any, pool);
+
+      const result = await repo.debit('w1', '25');
+
+      expect(result.newBalance).toBe('75');
+      expect(pool.connect).toHaveBeenCalledTimes(2);
+    });
+
+    it('surfaces an exhausted lock timeout retry without changing balance', async () => {
+      seedWallet(store, { id: 'w1', balance: '100' });
+      pool = makeMockPool(store, { lockTimeoutFailures: 3 });
+      repo = new WalletsRepository({} as any, pool);
+
+      await expect(repo.debit('w1', '25')).rejects.toMatchObject({
+        code: '55P03',
+      });
+
+      expect(store.get('w1')?.balance).toBe('100');
+      expect(pool.connect).toHaveBeenCalledTimes(3);
+    });
+
+    it('rolls back the balance when ledger recording fails', async () => {
+      seedWallet(store, { id: 'w1', balance: '100' });
+      pool = makeMockPool(store, { ledgerFailures: 1 });
+      repo = new WalletsRepository({} as any, pool);
+
+      await expect(repo.debit('w1', '25')).rejects.toThrow('ledger write failed');
+
+      expect(store.get('w1')?.balance).toBe('100');
+    });
+
     it('throws InsufficientBalanceError when amount > balance', async () => {
       seedWallet(store, { id: 'w1', balance: '100' });
       await expect(repo.debit('w1', '101')).rejects.toBeInstanceOf(
@@ -257,21 +321,50 @@ describe('WalletsRepository', () => {
       expect(result.newBalance).toBe('0.000000001');
     });
 
-    it('handles 30+ digit balances without loss', async () => {
-      // 36-digit integer balance (beyond Number() precision)
-      const balance = '123456789012345678901234567890123456';
+    it('handles max-precision 18-digit balances without loss', async () => {
+      // wallets.balance is NUMERIC(36, 18): 18 integer digits is the maximum
+      // magnitude the column can hold (beyond Number()'s ~15-16 digit
+      // precision), so this is the largest realistic balance, not an
+      // arbitrary large number that could never be persisted.
+      const balance = '999999999999999999';
       const amount  = '1';
       seedWallet(store, { id: 'w1', balance });
       const result = await repo.debit('w1', amount);
-      expect(result.newBalance).toBe('123456789012345678901234567890123455');
+      expect(result.newBalance).toBe('999999999999999998');
     });
 
-    it('rejects overdraft on 30+ digit balance by 1 unit', async () => {
-      const balance = '123456789012345678901234567890123456';
-      const amount  = '123456789012345678901234567890123457';
+    it('rejects overdraft on max-precision 18-digit balance using exact comparison', async () => {
+      // Both values are realistic (≤ 18 integer digits, fits NUMERIC(36,18))
+      // and differ only past the ~15-16 significant digits Number() can
+      // represent exactly, so this only passes if compareDecimals() is used.
+      const balance = '111111111111111111';
+      const amount  = '999999999999999999';
       seedWallet(store, { id: 'w1', balance });
       await expect(repo.debit('w1', amount)).rejects.toBeInstanceOf(
         InsufficientBalanceError,
+      );
+    });
+
+    it('rejects a debit amount whose integer part overflows NUMERIC(36,18)', async () => {
+      // 19 integer digits exceeds the column's 18-digit maximum — this must
+      // be rejected before any lock is acquired, not surfaced as a
+      // (misleading) insufficient-balance error.
+      seedWallet(store, { id: 'w1', balance: '999999999999999999' });
+      const amount = '1000000000000000000'; // 19 digits
+      await expect(repo.debit('w1', amount)).rejects.toBeInstanceOf(
+        AmountOverflowError,
+      );
+    });
+
+    it('rejects a debit amount with more fractional digits than the column scale', async () => {
+      // NUMERIC(36,18) supports at most 18 fractional digits. Postgres would
+      // silently round a 19th-digit amount rather than reject it, which
+      // would desync the immutable ledger entry (recorded verbatim) from the
+      // actual balance change. The application layer must reject it instead.
+      seedWallet(store, { id: 'w1', balance: '1' });
+      const amount = '0.0000000000000000001'; // 19 fractional digits
+      await expect(repo.debit('w1', amount)).rejects.toBeInstanceOf(
+        AmountScaleError,
       );
     });
 
@@ -323,6 +416,39 @@ describe('WalletsRepository', () => {
       seedWallet(store, { id: 'w1', balance: '0' });
       const wallet = await repo.credit('w1', '0.000000001');
       expect(wallet.balance).toBe('0.000000001');
+    });
+
+    it('credits up to the exact max-precision boundary (18 integer digits)', async () => {
+      seedWallet(store, { id: 'w1', balance: '999999999999999998' });
+      const wallet = await repo.credit('w1', '1');
+      expect(wallet.balance).toBe('999999999999999999');
+    });
+
+    it('rejects a credit amount whose integer part overflows NUMERIC(36,18) on its own', async () => {
+      seedWallet(store, { id: 'w1', balance: '0' });
+      const amount = '1000000000000000000'; // 19 digits, invalid regardless of balance
+      await expect(repo.credit('w1', amount)).rejects.toBeInstanceOf(
+        AmountOverflowError,
+      );
+    });
+
+    it('rejects a credit amount with more fractional digits than the column scale', async () => {
+      seedWallet(store, { id: 'w1', balance: '0' });
+      const amount = '0.0000000000000000001'; // 19 fractional digits
+      await expect(repo.credit('w1', amount)).rejects.toBeInstanceOf(
+        AmountScaleError,
+      );
+    });
+
+    it('rejects a credit that would push an existing balance past the column bound', async () => {
+      // Neither the current balance nor the amount overflows on its own —
+      // only their sum does. This can only be caught after the row is
+      // locked and the current balance is known, so it must be checked
+      // there (before the UPDATE), not just at the pre-lock format check.
+      seedWallet(store, { id: 'w1', balance: '999999999999999999' });
+      await expect(repo.credit('w1', '1')).rejects.toBeInstanceOf(
+        AmountOverflowError,
+      );
     });
   });
 });

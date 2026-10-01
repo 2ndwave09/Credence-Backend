@@ -162,6 +162,22 @@ const resolveActorEmail = (input: AuditLogInput): string =>
   (input as unknown as { adminEmail?: string }).adminEmail ??
   'unknown@unknown'
 
+/**
+ * Result of a retention purge operation on audit log entries.
+ */
+export interface AuditLogPurgeResult {
+  /** Number of expired entries identified before the purge. */
+  expiredCount: number
+  /** Number of entries actually deleted. */
+  deletedCount: number
+  /** Whether the operation was a dry run (no actual deletions). */
+  dryRun: boolean
+  /** The TTL threshold in days that was used. */
+  ttlDays: number
+  /** Optional tenant ID scope applied to the purge. */
+  tenantId?: string
+}
+
 export interface AuditLogRepository {
   append(input: AuditLogInput): Promise<AuditLogEntry>
   appendBatch(inputs: AuditLogInput[]): Promise<AuditLogEntry[]>
@@ -169,26 +185,32 @@ export interface AuditLogRepository {
   getTopTalkers(limit?: number, windowMinutes?: number, now?: Date): Promise<TopTalkersReport>
   getAll(): Promise<AuditLogEntry[]>
   clear(): Promise<void>
+  /**
+   * Purge audit log entries older than the specified number of days.
+   *
+   * Security: this operation is tenant-scoped. When `tenantId` is provided,
+   * only entries belonging to that tenant are purged; otherwise all tenants
+   * are included (requires privileged access).
+   *
+   * @param olderThanDays - Delete entries with `occurred_at` earlier than
+   *   NOW() - olderThanDays days. A value of 0 means "keep forever" and
+   *   returns zero counts without deleting anything.
+   * @param options - Optional controls for batch size, tenant scoping, and
+   *   dry-run mode.
+   */
+  purgeExpired(
+    olderThanDays: number,
+    options?: { batchSize?: number; tenantId?: string; dryRun?: boolean }
+  ): Promise<AuditLogPurgeResult>
 }
 
 export class PostgresAuditLogsRepository implements AuditLogRepository {
   constructor(private readonly db: Queryable) {}
 
-  /**
-   * Append an audit log entry with hash-chain integrity.
-   *
-   * The insert is done inside a serialised advisory-locked section so that
-   * concurrent writers cannot interleave and break the chain.
-   *
-   * Steps:
-   * 1. Acquire advisory lock to serialize chain writes
-   * 2. Fetch the row_hash of the latest row (by seq) — this becomes our prev_hash
-   * 3. Allocate a new seq from the sequence
-   * 4. Compute row_hash = SHA-256( prev_hash | id | occurred_at | ... )
-   * 5. INSERT the row with prev_hash and row_hash
-   * 6. Release advisory lock (auto on COMMIT/ROLLBACK if in transaction)
-   */
   async append(input: AuditLogInput): Promise<AuditLogEntry> {
+    if (!input.tenantId) {
+      throw new Error('AuditLogRepository.append requires tenantId for tenant isolation')
+    }
     const id = randomUUID()
     const actorId = resolveActorId(input)
     const actorEmail = resolveActorEmail(input)
@@ -203,8 +225,14 @@ export class PostgresAuditLogsRepository implements AuditLogRepository {
     // For standalone calls (no outer transaction), we use a DO block pattern.
     const result = await this.db.query<AuditLogRow>(
       `
-      WITH prev AS (
-        SELECT row_hash FROM audit_logs ORDER BY seq DESC LIMIT 1
+      WITH locked AS (
+        SELECT true AS locked
+        FROM pg_advisory_xact_lock(hashtext('audit_logs_append_lock'))
+      ),
+      prev AS (
+        SELECT row_hash FROM audit_logs
+        WHERE (SELECT locked FROM locked)
+        ORDER BY seq DESC LIMIT 1
       ),
       new_seq AS (
         SELECT nextval('audit_logs_seq') AS seq_val
@@ -290,15 +318,95 @@ export class PostgresAuditLogsRepository implements AuditLogRepository {
   }
 
   async appendBatch(inputs: AuditLogInput[]): Promise<AuditLogEntry[]> {
-    const entries: AuditLogEntry[] = []
+    const n = inputs.length
+    if (n === 0) return []
+    if (n === 1) return [await this.append(inputs[0])]
+
     for (const input of inputs) {
-      const entry = await this.append(input)
-      entries.push(entry)
+      if (!input.tenantId) {
+        throw new Error('AuditLogRepository.appendBatch requires tenantId for tenant isolation')
+      }
     }
-    return entries
+
+    const params: unknown[] = []
+    const ctes: string[] = []
+
+    for (let i = 0; i < n; i++) {
+      const input = inputs[i]
+      const base = params.length
+      params.push(
+        randomUUID(),
+        resolveActorId(input),
+        resolveActorEmail(input),
+        input.action,
+        input.resourceType,
+        input.resourceId,
+        JSON.stringify(input.details ?? {}),
+        input.status ?? 'success',
+        input.ipAddress ?? null,
+        input.errorMessage ?? null,
+        input.tenantId,
+        input.requestId ?? null,
+      )
+
+      const p = (offset: number) => `$${base + offset + 1}`
+      const prevSrc = i === 0
+        ? '(SELECT COALESCE(row_hash, \'GENESIS\') FROM audit_logs ORDER BY seq DESC LIMIT 1)'
+        : `(SELECT row_hash FROM ins${i})`
+
+      ctes.push(`ins${i + 1} AS (
+  INSERT INTO audit_logs (
+    id, seq, actor_id, actor_email, action, resource_type, resource_id,
+    details_json, status, ip_address, error_message, tenant_id, request_id,
+    prev_hash, row_hash
+  )
+  SELECT
+    ${p(0)}::uuid,
+    nextval('audit_logs_seq'),
+    ${p(1)}, ${p(2)}, ${p(3)}, ${p(4)}, ${p(5)},
+    ${p(6)}::jsonb, ${p(7)}, ${p(8)}, ${p(9)}, ${p(10)}, ${p(11)},
+    COALESCE(${prevSrc}, 'GENESIS'),
+    encode(
+      sha256(
+        convert_to(
+          COALESCE(${prevSrc}, 'GENESIS') || '|' ||
+          ${p(0)}::text || '|' ||
+          NOW()::text || '|' ||
+          ${p(1)} || '|' ||
+          ${p(3)} || '|' ||
+          ${p(4)} || '|' ||
+          ${p(5)} || '|' ||
+          ${p(6)} || '|' ||
+          ${p(7)} || '|' ||
+          ${p(10)} || '|' ||
+          COALESCE(${p(11)}, ''),
+          'UTF8'
+        )
+      ),
+      'hex'
+    )
+  RETURNING
+    id, occurred_at, actor_id, actor_email, action, resource_type, resource_id,
+    details_json, status, ip_address, error_message, tenant_id, request_id,
+    seq, prev_hash, row_hash
+)`)
+    }
+
+    const selects = Array.from({ length: n }, (_, i) => `SELECT * FROM ins${i + 1}`)
+    const sql = `WITH\n${ctes.join(',\n')}\n${selects.join('\nUNION ALL\n')}\nORDER BY seq ASC`
+
+    const result = await this.db.query<AuditLogRow>(sql, params)
+    return result.rows.map(mapAuditLog)
   }
 
   async query(filters?: AuditLogFilters, limit = 100, cursor?: string): Promise<{ logs: AuditLogEntry[]; hasNextPage: boolean; nextCursor?: string }> {
+    if (!filters?.tenantId) {
+      throw new Error('AuditLogRepository.query requires tenantId for tenant isolation')
+    }
+    if (!Number.isFinite(limit) || limit < 1) {
+      throw new Error('AuditLogRepository.query requires a positive finite limit')
+    }
+    limit = Math.floor(limit)
     const whereClauses: string[] = []
     const params: unknown[] = []
     applyFilters(filters, whereClauses, params)
@@ -369,6 +477,9 @@ export class PostgresAuditLogsRepository implements AuditLogRepository {
     windowMinutes = DEFAULT_TOP_TALKERS_WINDOW_MINUTES,
     now = new Date(),
   ): Promise<TopTalkersReport> {
+    if (!Number.isFinite(windowMinutes) || windowMinutes < 0) {
+      throw new Error('AuditLogRepository.getTopTalkers requires a non-negative finite windowMinutes')
+    }
     const effectiveLimit = Math.min(Math.max(1, limit), MAX_TOP_TALKERS_LIMIT)
     const windowEnd = now
     const windowStart = new Date(now.getTime() - windowMinutes * 60 * 1000)
@@ -427,6 +538,84 @@ export class PostgresAuditLogsRepository implements AuditLogRepository {
   async clear(): Promise<void> {
     await this.db.query('DELETE FROM audit_logs')
   }
+
+  async purgeExpired(
+    olderThanDays: number,
+    options?: { batchSize?: number; tenantId?: string; dryRun?: boolean },
+  ): Promise<AuditLogPurgeResult> {
+    // 0 means keep forever — no purging
+    if (olderThanDays === 0) {
+      return { expiredCount: 0, deletedCount: 0, dryRun: options?.dryRun ?? false, ttlDays: 0, tenantId: options?.tenantId }
+    }
+
+    if (!Number.isFinite(olderThanDays) || olderThanDays < 0) {
+      throw new Error('AuditLogRepository.purgeExpired requires olderThanDays >= 0')
+    }
+
+    const batchSize = options?.batchSize ?? 5_000
+    const dryRun = options?.dryRun ?? false
+    const tenantId = options?.tenantId
+
+    if (!Number.isFinite(batchSize) || batchSize < 1) {
+      throw new Error('AuditLogRepository.purgeExpired requires batchSize >= 1')
+    }
+
+    // Count expired entries
+    const countParams: unknown[] = [olderThanDays]
+    let countSql = `SELECT COUNT(*)::int AS cnt FROM audit_logs
+       WHERE occurred_at < NOW() - ($1 || ' days')::interval`
+    if (tenantId) {
+      countParams.push(tenantId)
+      countSql += ` AND tenant_id = $2`
+    }
+
+    const countResult = await this.db.query<{ cnt: number }>(countSql, countParams)
+    const expiredCount = Number(countResult.rows[0]?.cnt ?? 0)
+
+    if (dryRun || expiredCount === 0) {
+      return { expiredCount, deletedCount: 0, dryRun, ttlDays: olderThanDays, tenantId }
+    }
+
+    // Delete in a batched CTE to avoid long-running transactions.
+    // Loop with a guard: maxIterations = ceil(expiredCount/batchSize) + 1.
+    // The +1 handles the final iteration where deleted < batchSize triggers
+    // the break. If new rows expire between COUNT and the final DELETE, they
+    // won't be captured this run — that's intentional; the next scheduled run
+    // will pick them up.
+    const deleteParams: unknown[] = [olderThanDays, batchSize]
+    let orgFilter = ''
+    if (tenantId) {
+      deleteParams.push(tenantId)
+      orgFilter = ` AND tenant_id = $3`
+    }
+
+    // Loop until no more expired rows or batch limit is reached in aggregate
+    let totalDeleted = 0
+    const maxIterations = Math.ceil(expiredCount / batchSize) + 1
+    for (let i = 0; i < maxIterations; i++) {
+      const result = await this.db.query<{ cnt: number }>(
+        `WITH rows AS (
+           SELECT id FROM audit_logs
+           WHERE occurred_at < NOW() - ($1 || ' days')::interval${orgFilter}
+           LIMIT $2
+         )
+         DELETE FROM audit_logs WHERE id IN (SELECT id FROM rows)
+         RETURNING 1`,
+        deleteParams,
+      )
+      const deleted = result.rowCount ?? 0
+      totalDeleted += deleted
+      if (deleted < batchSize) break
+    }
+
+    return {
+      expiredCount,
+      deletedCount: totalDeleted,
+      dryRun: false,
+      ttlDays: olderThanDays,
+      tenantId,
+    }
+  }
 }
 
 export class InMemoryAuditLogsRepository implements AuditLogRepository {
@@ -434,11 +623,14 @@ export class InMemoryAuditLogsRepository implements AuditLogRepository {
   private seqCounter = 0
 
   async append(input: AuditLogInput): Promise<AuditLogEntry> {
+    if (!input.tenantId) {
+      throw new Error('AuditLogRepository.append requires tenantId for tenant isolation')
+    }
     const id = randomUUID()
     const actorId = resolveActorId(input)
     const actorEmail = resolveActorEmail(input)
     const seq = ++this.seqCounter
-    const occurredAt = new Date().toISOString()
+    const occurredAt = input.occurredAt ?? new Date().toISOString()
     const detailsStr = JSON.stringify(input.details ?? {})
     const statusVal = input.status ?? 'success'
 
@@ -503,6 +695,10 @@ export class InMemoryAuditLogsRepository implements AuditLogRepository {
   }
 
   async query(filters?: AuditLogFilters, limit = 100, cursor?: string): Promise<{ logs: AuditLogEntry[]; hasNextPage: boolean; nextCursor?: string }> {
+    if (!Number.isFinite(limit) || limit < 1) {
+      throw new Error('AuditLogRepository.query requires a positive finite limit')
+    }
+    limit = Math.floor(limit)
     let filtered = this.logs as AuditLogEntry[]
 
     if (filters?.action) {
@@ -581,6 +777,9 @@ export class InMemoryAuditLogsRepository implements AuditLogRepository {
     windowMinutes = DEFAULT_TOP_TALKERS_WINDOW_MINUTES,
     now = new Date(),
   ): Promise<TopTalkersReport> {
+    if (!Number.isFinite(windowMinutes) || windowMinutes < 0) {
+      throw new Error('AuditLogRepository.getTopTalkers requires a non-negative finite windowMinutes')
+    }
     const effectiveLimit = Math.min(Math.max(1, limit), MAX_TOP_TALKERS_LIMIT)
     const windowEnd = now
     const windowStart = new Date(now.getTime() - windowMinutes * 60 * 1000)
@@ -631,5 +830,72 @@ export class InMemoryAuditLogsRepository implements AuditLogRepository {
   async clear(): Promise<void> {
     this.logs = []
     this.seqCounter = 0
+  }
+
+  async purgeExpired(
+    olderThanDays: number,
+    options?: { batchSize?: number; tenantId?: string; dryRun?: boolean },
+  ): Promise<AuditLogPurgeResult> {
+    // 0 means keep forever — no purging
+    if (olderThanDays === 0) {
+      return { expiredCount: 0, deletedCount: 0, dryRun: options?.dryRun ?? false, ttlDays: 0, tenantId: options?.tenantId }
+    }
+
+    if (!Number.isFinite(olderThanDays) || olderThanDays < 0) {
+      throw new Error('AuditLogRepository.purgeExpired requires olderThanDays >= 0')
+    }
+
+    const batchSize = options?.batchSize ?? 5_000
+    const dryRun = options?.dryRun ?? false
+    const tenantId = options?.tenantId
+
+    if (!Number.isFinite(batchSize) || batchSize < 1) {
+      throw new Error('AuditLogRepository.purgeExpired requires batchSize >= 1')
+    }
+    const cutoff = new Date(Date.now() - olderThanDays * 24 * 60 * 60 * 1000)
+
+    // Find expired entries (occurred_at before cutoff)
+    const expiredIndices: number[] = []
+    for (let i = 0; i < this.logs.length; i++) {
+      const entry = this.logs[i]
+      if (new Date(entry.timestamp) < cutoff) {
+        if (!tenantId || entry.tenantId === tenantId) {
+          expiredIndices.push(i)
+        }
+      }
+    }
+
+    const expiredCount = expiredIndices.length
+
+    if (dryRun || expiredCount === 0) {
+      return { expiredCount, deletedCount: 0, dryRun, ttlDays: olderThanDays, tenantId }
+    }
+
+    // Delete in batches to mirror Postgres behavior and remain resilient to
+    // partial failures. Each iteration removes at most `batchSize` entries.
+    let totalDeleted = 0
+    const maxIterations = Math.ceil(expiredCount / batchSize) + 1
+    for (let i = 0; i < maxIterations; i++) {
+      const remaining = this.logs.filter((entry) => {
+        if (new Date(entry.timestamp) >= cutoff) return false
+        if (tenantId && entry.tenantId !== tenantId) return false
+        return true
+      })
+      if (remaining.length === 0) break
+      const toDelete = new Set(remaining.slice(0, batchSize))
+      const before = this.logs.length
+      this.logs = this.logs.filter((entry) => !toDelete.has(entry))
+      const deleted = before - this.logs.length
+      totalDeleted += deleted
+      if (deleted < batchSize) break
+    }
+
+    return {
+      expiredCount,
+      deletedCount: totalDeleted,
+      dryRun: false,
+      ttlDays: olderThanDays,
+      tenantId,
+    }
   }
 }

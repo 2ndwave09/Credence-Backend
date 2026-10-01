@@ -432,6 +432,63 @@ instrumentSlowQueryLogging(replicaPool, "replica");
 instrumentQueryTracing(replicaPool, "replica");
 instrumentPreparedStatementCache(replicaPool, replicaPreparedStatementCache);
 
+// ── Pool Saturation Monitor ───────────────────────────────────────────────────
+// Polls every 10s and emits a warning when saturation exceeds 80%.
+
+const SATURATION_THRESHOLD = 0.80;
+
+interface PoolSaturationFrame {
+  pool: string;
+  activeConnections: number;
+  idleConnections: number;
+  pendingRequests: number;
+  maxPoolSize: number;
+  saturationRatio: number;
+}
+
+function checkPoolSaturation(
+  p: Pool,
+  maxSize: number,
+  poolName: string,
+): PoolSaturationFrame | null {
+  const activeConnections = p.totalCount - p.idleCount;
+  const saturationRatio = maxSize > 0 ? activeConnections / maxSize : 0;
+  if (saturationRatio <= SATURATION_THRESHOLD) return null;
+  return {
+    pool: poolName,
+    activeConnections,
+    idleConnections: p.idleCount,
+    pendingRequests: p.waitingCount,
+    maxPoolSize: maxSize,
+    saturationRatio,
+  };
+}
+
+function pollPoolSaturation(): void {
+  for (const entry of [
+    { p: pool, max: POOL_MAX, name: "api" },
+    { p: workerPool, max: WORKER_MAX, name: "worker" },
+    { p: replicaPool, max: REPLICA_MAX, name: "replica" },
+  ] as const) {
+    const frame = checkPoolSaturation(entry.p, entry.max, entry.name);
+    if (frame) {
+      logger.warn({
+        eventType: LogEventType.GENERIC_WARN,
+        message: "Pool saturation exceeds threshold",
+        pool: frame.pool,
+        activeConnections: frame.activeConnections,
+        pendingRequests: frame.pendingRequests,
+        maxPoolSize: frame.maxPoolSize,
+        saturationRatio: Math.round(frame.saturationRatio * 100) / 100,
+      });
+    }
+  }
+}
+
+const SATURATION_POLL_INTERVAL_MS = 10_000;
+const saturationTimer = setInterval(pollPoolSaturation, SATURATION_POLL_INTERVAL_MS);
+saturationTimer.unref();
+
 /**
  * Helper to execute an operation on the replica, falling back to primary
  * if the replica is lagging or disconnected.
@@ -465,3 +522,33 @@ export async function withReplica<T>(
     throw err;
   }
 }
+
+/**
+ * Test-only helpers for exercising pool boundary and recovery behavior.
+ * These are exported so focused tests can deterministically simulate
+ * tenant budget exhaustion, release accounting, and replica fallback
+ * without touching production call sites.
+ * @internal Exported for testing only.
+ */
+export const __poolTestHooks = {
+  getTenantConnectionCount(tenantId: string): number {
+    return tenantConnectionCounts.get(tenantId) ?? 0;
+  },
+  setTenantConnectionCount(tenantId: string, count: number): void {
+    if (count <= 0) {
+      tenantConnectionCounts.delete(tenantId);
+    } else {
+      tenantConnectionCounts.set(tenantId, count);
+    }
+  },
+  clearTenantConnectionCounts(): void {
+    tenantConnectionCounts.clear();
+  },
+  getTenantConnectionBudget(): number {
+    return TENANT_CONNECTION_BUDGET;
+  },
+  getMaxReplicaLagMs(): number {
+    return MAX_REPLICA_LAG_MS;
+  },
+  checkPoolSaturation,
+};

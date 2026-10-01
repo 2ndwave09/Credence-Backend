@@ -8,26 +8,83 @@ const anyObjectSchema = z.object({}).passthrough().openapi('AnyObject');
 import yaml from 'yaml';
 import fs from 'fs';
 import path from 'path';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 import * as schemas from '../src/schemas/index.js';
 
 extendZodWithOpenApi(z);
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+/** Default on-disk location of the generated spec. Overridable for tests. */
+export const DEFAULT_OUTPUT_PATH = path.resolve(__dirname, '../docs/openapi.yaml');
+
+/**
+ * Static document metadata, hoisted so the generated spec is a pure function
+ * of (component schemas, registered paths, these options). Nothing mutates it
+ * at runtime, so repeated runs cannot silently drift `info`/`servers`.
+ */
+export const OPENAPI_DOCUMENT_OPTIONS = {
+  openapi: '3.0.0',
+  info: { version: '1.0.0', title: 'Credence API', description: 'Generated OpenAPI documentation from Zod schemas' },
+  servers: [{ url: 'https://api.credence.org/v1' }],
+};
+
+/**
+ * Bearer token auth used by governance and dispute routes (requireUserAuth).
+ * Extracted so the security-scheme registration is a separately testable seam
+ * and so `bearerAuth` can be asserted against the scheme actually registered.
+ */
+export const BEARER_AUTH_SCHEME = {
+  type: 'http' as const,
+  scheme: 'bearer' as const,
+  description: 'API key sent as `Authorization: Bearer <key>`',
+};
+
+/** Security requirement referencing `BEARER_AUTH_SCHEME` by its component name. */
+export const bearerAuth = [{ bearerAuth: [] }];
+
+/**
+ * Selects the reusable component schemas from a module namespace.
+ *
+ * INVARIANT: the `instanceof z.ZodType` filter is load-bearing. The
+ * `src/schemas/index.js` barrel also re-exports plain runtime values (e.g. the
+ * REPORT_TYPES / PAYOUT_STATUS_ENUM const arrays). Without this filter those
+ * non-schemas would be handed to `registerComponent` and generation would fail
+ * with a TypeError instead of producing a spec.
+ */
+export const selectComponentSchemas = (source: Record<string, unknown>): [string, z.ZodType][] =>
+  Object.entries(source).filter((entry): entry is [string, z.ZodType] => entry[1] instanceof z.ZodType);
+
+/**
+ * Registers the bearer security scheme on a registry.
+ * Idempotent per registry: re-registering the same name on the *same* registry
+ * is a duplicate, so callers get a fresh registry per run.
+ */
+export const registerSecuritySchemes = (target: OpenAPIRegistry): void => {
+  target.registerComponent('securitySchemes', 'bearerAuth', BEARER_AUTH_SCHEME);
+};
+
+/**
+ * Registers every Zod schema found in `source` as an OpenAPI component.
+ *
+ * Non-Zod exports are skipped rather than throwing (see
+ * `selectComponentSchemas`), and an empty source is a valid no-op rather than
+ * an error — that keeps the generator usable while the schema barrel is being
+ * migrated, instead of failing with an opaque TypeError.
+ */
+export const registerComponentSchemas = (target: OpenAPIRegistry, source: Record<string, unknown> = schemas): void => {
+  for (const [key, schema] of selectComponentSchemas(source)) {
+    target.registerComponent('schemas', key, schema);
+  }
+};
+
 const registry = new OpenAPIRegistry();
 
 // Register reusable component schemas
-for (const [key, schema] of Object.entries(schemas)) {
-  if (schema instanceof z.ZodType) {
-    registry.registerComponent('schemas', key, schema);
-  }
-}
+registerComponentSchemas(registry);
 
 // Bearer token auth used by governance and dispute routes (requireUserAuth)
-registry.registerComponent('securitySchemes', 'bearerAuth', {
-  type: 'http',
-  scheme: 'bearer',
-  description: 'API key sent as `Authorization: Bearer <key>`',
-});
-const bearerAuth = [{ bearerAuth: [] }];
+registerSecuritySchemes(registry);
 
 // Health + JWKS (required by openapi-drift gate)
 registry.registerPath({
@@ -869,64 +926,18 @@ registry.registerPath({
   },
 });
 
-// Admin Replay Webhook API
+// Admin System API
 registry.registerPath({
-  method: 'post',
-  path: '/api/admin/replay-webhook',
-  summary: 'Replay a failed webhook delivery',
-  description:
-    'Replays a specific failed webhook delivery from the DLQ by id (passed in body). Audit-logged via WebhookService.replayWebhook.',
-  tags: ['Admin'],
+  method: 'get',
+  path: '/api/admin/system/backup-status',
+  summary: 'System Backup Status',
+  description: 'Returns the status of the continuous WAL archiving backup job.',
+  tags: ['Admin System'],
   security: bearerAuth,
-  request: {
-    body: {
-      required: true,
-      content: { 'application/json': { schema: schemas.replayWebhookBodySchema } },
-    },
-  },
   responses: {
     200: {
-      description: 'Webhook replayed successfully',
-      content: {
-        'application/json': {
-          schema: z.any(), // Actual response is WebhookDeliveryResult
-        },
-      },
-    },
-    400: {
-      description: 'Validation error',
-      content: { 'application/json': { schema: z.object({ error: z.string(), message: z.string() }) } },
-    },
-    404: {
-      description: 'DLQ entry or Webhook not found',
-      content: { 'application/json': { schema: z.object({ error: z.string(), message: z.string() }) } },
-    },
-  },
-});
-
-// Admin Reset Cache API
-registry.registerPath({
-  method: 'post',
-  path: '/api/admin/reset-cache',
-  summary: 'Reset a cache namespace',
-  description:
-    'Clears all cached entries in a specific cache namespace on demand. Simpler alternative to /purge-cache for operators who need to nuke an entire namespace. Audit-logged.',
-  tags: ['Admin'],
-  security: bearerAuth,
-  request: {
-    body: {
-      required: true,
-      content: { 'application/json': { schema: schemas.resetCacheBodySchema } },
-    },
-  },
-  responses: {
-    200: {
-      description: 'Cache namespace reset successfully',
-      content: { 'application/json': { schema: schemas.resetCacheResponseSchema } },
-    },
-    400: {
-      description: 'Validation error (e.g. missing namespace)',
-      content: { 'application/json': { schema: z.object({ error: z.string(), message: z.string() }) } },
+      description: 'Backup status returned successfully',
+      content: { 'application/json': { schema: schemas.backupStatusResponseSchema } },
     },
     401: {
       description: 'Missing or invalid bearer token',
@@ -939,44 +950,176 @@ registry.registerPath({
   },
 });
 
+// Reports paths
 registry.registerPath({
   method: 'post',
-  path: '/csp-report',
-  summary: 'CSP violation report endpoint',
-  description: 'Endpoint for browsers to post Content Security Policy violation reports.',
-  tags: ['Security'],
+  path: '/api/reports',
+  summary: 'Start a report generation job',
+  description: 'Queues an asynchronous report generation job for the given report type. Returns job metadata immediately.',
+  tags: ['Reports'],
   request: {
     body: {
       required: true,
-      content: {
-        'application/json': { schema: schemas.cspReportSchema },
-        'application/csp-report': { schema: schemas.cspReportSchema },
-      },
+      content: { 'application/json': { schema: schemas.createReportBodySchema } },
     },
   },
   responses: {
-    204: {
-      description: 'Report received',
+    202: {
+      description: 'Report job queued',
+      content: {
+        'application/json': {
+          schema: z.object({ jobId: z.string(), status: z.string(), type: z.string(), createdAt: z.string() }),
+        },
+      },
     },
     400: {
-      description: 'Validation error',
-      content: {
-        'application/json': { schema: z.any() },
-      },
+      description: 'Validation error (invalid or missing report type)',
+      content: { 'application/json': { schema: z.object({ error: z.string(), details: z.array(z.any()) }) } },
+    },
+    429: {
+      description: 'Rate limit exceeded (maximum concurrent jobs per org)',
+      content: { 'application/json': { schema: z.object({ error: z.string(), code: z.string() }) } },
     },
   },
 });
 
-const generator = new OpenApiGeneratorV3(registry.definitions);
-
-const document = generator.generateDocument({
-  openapi: '3.0.0',
-  info: { version: '1.0.0', title: 'Credence API', description: 'Generated OpenAPI documentation from Zod schemas' },
-  servers: [{ url: 'https://api.credence.org/v1' }],
+registry.registerPath({
+  method: 'get',
+  path: '/api/reports/top-talkers',
+  summary: 'Top talkers report',
+  description: 'Returns the top N tenants by request count in the aggregate window.',
+  tags: ['Reports'],
+  request: { query: schemas.topTalkersQuerySchema },
+  responses: {
+    200: {
+      description: 'Top talkers data',
+      content: { 'application/json': { schema: schemas.topTalkersResponseSchema } },
+    },
+  },
 });
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const docsPath = path.resolve(__dirname, '../docs/openapi.yaml');
-fs.mkdirSync(path.dirname(docsPath), { recursive: true });
-fs.writeFileSync(docsPath, yaml.stringify(JSON.parse(JSON.stringify(document))), 'utf-8');
-console.log('OpenAPI spec generated at docs/openapi.yaml');
+registry.registerPath({
+  method: 'get',
+  path: '/api/reports/{jobId}',
+  summary: 'Get report job status',
+  description: 'Returns the status and artifact URL of a report generation job.',
+  tags: ['Reports'],
+  request: { params: schemas.reportJobParamsSchema },
+  responses: {
+    200: {
+      description: 'Report job status',
+      content: {
+        'application/json': {
+          schema: z.object({ jobId: z.string(), status: z.string(), type: z.string(), artifactUrl: z.string().optional(), failureReason: z.string().optional(), createdAt: z.string(), updatedAt: z.string() }),
+        },
+      },
+    },
+    404: {
+      description: 'Report job not found',
+      content: { 'application/json': { schema: z.object({ error: z.string() }) } },
+    },
+  },
+});
+
+registry.registerPath({
+  method: 'get',
+  path: '/api/reports/download/{key}',
+  summary: 'Download a report artifact',
+  description: 'Serves the report artifact using a signed URL with expires and signature query parameters.',
+  tags: ['Reports'],
+  request: {
+    params: z.object({ key: z.string().min(1) }),
+    query: z.object({ expires: z.string().min(1), signature: z.string().min(1) }),
+  },
+  responses: {
+    200: {
+      description: 'Report artifact (PDF)',
+      content: { 'application/pdf': { schema: z.any() } },
+    },
+    400: {
+      description: 'Missing required query parameters (expires or signature)',
+      content: { 'application/json': { schema: z.object({ error: z.string(), code: z.string() }) } },
+    },
+    401: {
+      description: 'Invalid or expired signed URL',
+      content: { 'application/json': { schema: z.object({ error: z.string(), code: z.string() }) } },
+    },
+  },
+});
+
+/**
+ * Renders an OpenAPI document from a registry's definitions.
+ *
+ * Exposed (rather than inlined at module scope) so tests can drive generation
+ * against an isolated registry and assert determinism without writing files.
+ */
+export const generateDocument = (source: OpenAPIRegistry = registry) =>
+  new OpenApiGeneratorV3(source.definitions).generateDocument(OPENAPI_DOCUMENT_OPTIONS);
+
+/**
+ * Serialises a document to the YAML committed at docs/openapi.yaml.
+ *
+ * The `JSON.parse(JSON.stringify(...))` round-trip is load-bearing, not
+ * cosmetic. It guarantees the committed file is plain, JSON-serialisable data:
+ * it drops `undefined` values, reduces Dates to ISO strings before `yaml` ever
+ * sees them, and throws loudly on a cyclic document instead of writing out an
+ * unreadable spec.
+ *
+ * NOTE: the round-trip does NOT strip Zod internals. `@asteasolutions/
+ * zod-to-openapi@8` targets Zod v3 while this repo depends on Zod v4, so any
+ * component not referenced by a registered path is emitted as raw Zod internals
+ * (`def:`, `checks:`) instead of JSON Schema. The committed docs/openapi.yaml
+ * already contains ~940 such lines and the openapi-drift CI gate asserts the
+ * file is byte-identical, so changing this serialisation is deliberately out of
+ * scope here; it needs the dependency bump, and is pinned by a regression test.
+ */
+export const buildOpenApiYaml = (document: unknown): string =>
+  yaml.stringify(JSON.parse(JSON.stringify(document)));
+
+/**
+ * Writes generated YAML to disk, creating the parent directory if needed.
+ *
+ * Kept as a thin, separately testable wrapper around `fs` so permission / IO
+ * failures (EACCES on a read-only checkout, ENOSPC, EROFS) can be exercised
+ * without touching the real repo, and so a failure surfaces as a thrown error
+ * rather than a truncated or silently dropped spec file.
+ */
+export const writeOpenApiSpec = (outputPath: string, content: string): void => {
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+  fs.writeFileSync(outputPath, content, 'utf-8');
+};
+
+export interface RunGenerateOpenApiOptions {
+  outputPath?: string;
+  log?: (message: string) => void;
+}
+
+/**
+ * Orchestrates generate-then-write.
+ *
+ * INVARIANTS:
+ * - The success log is emitted only *after* the write succeeds, so a caller
+ *   (or CI) that sees "generated at ..." can trust the file is on disk and
+ *   complete. There is no partially-written success state.
+ * - The write is atomic from the caller's perspective: the document is fully
+ *   serialised in memory before `writeOpenApiSpec` is called, so a failure
+ *   while serialising never truncates an existing spec.
+ * - Output is deterministic: same inputs => byte-identical YAML, which is what
+ *   keeps `git diff --exit-code docs/openapi.yaml` and the openapi-drift gate
+ *   meaningful.
+ */
+export const runGenerateOpenApi = (options: RunGenerateOpenApiOptions = {}): string => {
+  const outputPath = options.outputPath ?? DEFAULT_OUTPUT_PATH;
+  const log = options.log ?? console.log;
+
+  const content = buildOpenApiYaml(generateDocument());
+  writeOpenApiSpec(outputPath, content);
+  log(`OpenAPI spec generated at ${path.relative(path.resolve(__dirname, '..'), outputPath)}`);
+  return outputPath;
+};
+
+// Only write when invoked as a CLI so importing this module (e.g. from tests)
+// has no filesystem side effects.
+if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
+  runGenerateOpenApi();
+}

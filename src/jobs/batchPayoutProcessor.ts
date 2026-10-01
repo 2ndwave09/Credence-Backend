@@ -1,4 +1,5 @@
 import type { SettlementStatus } from '../types/index.js'
+import { ValidationError } from '../lib/errors.js'
 
 /**
  * A single payout item in a batch.
@@ -57,6 +58,11 @@ export interface PayoutExecutor {
 
 export interface BatchPayoutOptions {
   logger?: (message: string) => void
+  /**
+   * Maximum number of items allowed in a single batch.
+   * Defaults to 1000. Non-positive or non-finite values fall back to the default.
+   */
+  maxBatchSize?: number
 }
 
 /**
@@ -66,9 +72,16 @@ export interface BatchPayoutOptions {
  * failure never corrupts the status of other items in the batch.
  * Failed items are marked as retry-eligible; already-processed
  * (duplicate) items are skipped.
+ *
+ * Invariants:
+ * - The entire payload is validated before any write or execution.
+ * - A duplicate transaction hash within the same batch is never executed twice.
+ * - A failure in one item never mutates the outcome of another item.
+ * - Every failed item is marked retry-eligible so no work is silently lost.
  */
 export class BatchPayoutProcessor {
   private readonly logger: (message: string) => void
+  private readonly maxBatchSize: number
 
   constructor(
     private readonly store: PayoutSettlementStore,
@@ -76,9 +89,70 @@ export class BatchPayoutProcessor {
     options: BatchPayoutOptions = {},
   ) {
     this.logger = options.logger ?? (() => {})
+    const configuredMax = options.maxBatchSize
+    this.maxBatchSize =
+      typeof configuredMax === 'number' &&
+      Number.isFinite(configuredMax) &&
+      Number.isInteger(configuredMax) &&
+      configuredMax > 0
+        ? configuredMax
+        : 1000
+  }
+
+  /**
+   * Validates the entire payload before applying any writes (atomic semantics).
+   * Throws a ValidationError immediately if any item in the batch is invalid.
+   */
+  public validatePayload(items: PayoutItem[]): void {
+    if (!Array.isArray(items)) {
+      throw new ValidationError('Batch payout payload must be an array of items')
+    }
+    if (items.length > this.maxBatchSize) {
+      throw new ValidationError(
+        `Batch payout payload exceeds the maximum of ${this.maxBatchSize} items`,
+      )
+    }
+    const seenTransactionHashes = new Set<string>()
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i]
+      if (!item || typeof item !== 'object') {
+        throw new ValidationError(`Item at index ${i} must be a valid payout item object`)
+      }
+      if (item.bondId === undefined || item.bondId === null || String(item.bondId).trim() === '') {
+        throw new ValidationError(`Item at index ${i} has invalid bondId: must not be empty`)
+      }
+      if (typeof item.amount !== 'string' || !/^\d+(\.\d{1,18})?$/.test(item.amount)) {
+        throw new ValidationError(
+          `Item at index ${i} has invalid amount: must be a valid non-negative numeric string with at most 18 decimal places`,
+        )
+      }
+      const numAmount = parseFloat(item.amount)
+      if (isNaN(numAmount) || numAmount < 0 || numAmount > 1e18) {
+        throw new ValidationError(`Item at index ${i} has invalid amount: must be between 0 and 1e18`)
+      }
+      if (
+        typeof item.transactionHash !== 'string' ||
+        item.transactionHash.trim().length === 0 ||
+        item.transactionHash.length > 128
+      ) {
+        throw new ValidationError(
+          `Item at index ${i} has invalid transactionHash: must be a string between 1 and 128 characters`,
+        )
+      }
+      if (seenTransactionHashes.has(item.transactionHash)) {
+        throw new ValidationError(
+          `Item at index ${i} has duplicate transactionHash ${item.transactionHash}`,
+        )
+      }
+      seenTransactionHashes.add(item.transactionHash)
+      if (item.settledAt !== undefined && (!(item.settledAt instanceof Date) || isNaN(item.settledAt.getTime()))) {
+        throw new ValidationError(`Item at index ${i} has invalid settledAt: must be a valid Date object`)
+      }
+    }
   }
 
   async process(items: PayoutItem[]): Promise<BatchPayoutResult> {
+    this.validatePayload(items)
     const startTime = new Date().toISOString()
     const startMs = Date.now()
 
@@ -217,5 +291,5 @@ export function getRetryableItems(
       .filter((r) => r.retryEligible)
       .map((r) => r.transactionHash),
   )
-  return original.filter((item) => retryHashes.has(item.transactionHash))
+  return original.filter((item) => retryHashs.has(item.transactionHash))
 }
