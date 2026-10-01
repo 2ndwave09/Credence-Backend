@@ -10,6 +10,25 @@ import { recordStaleCacheRead } from '../middleware/metrics.js'
 import { getInvalidationBus } from './invalidationBus.js'
 import { logger } from '../utils/logger.js'
 import { ValidationError, ServiceUnavailableError } from '../lib/errors.js'
+import { transactionContextStorage, runPostCommit, runRollback } from '../db/transaction.js'
+
+function computeStableHash(value: unknown): string {
+  return JSON.stringify(
+    value,
+    (key, val) => {
+      if (typeof val === 'bigint') return val.toString() + 'n'
+      if (val === undefined) return '__UNDEFINED__'
+      
+      if (val !== null && typeof val === 'object' && !Array.isArray(val)) {
+        return Object.keys(val).sort().reduce((acc, k) => {
+          acc[k] = (val as any)[k]
+          return acc
+        }, {} as Record<string, any>)
+      }
+      return val
+    }
+  )
+}
 
 export interface InvalidationOptions {
   /**
@@ -62,6 +81,9 @@ export async function invalidateCache(
           }
         }
       }
+    })
+    runRollback(async () => {
+      logger.debug(`Cache invalidation for ${namespace}:${key} rolled back — cache retains valid data`)
     })
     return true
   }
@@ -123,6 +145,9 @@ export async function invalidateMultiple(
         keys
       })
     })
+    runRollback(async () => {
+      logger.debug(`Batch cache invalidation for ${namespace} rolled back (${keys.length} keys) — cache retains valid data`)
+    })
     return keys.length
   }
 
@@ -168,6 +193,9 @@ export async function invalidatePattern(
         namespace,
         pattern
       })
+    })
+    runRollback(async () => {
+      logger.debug(`Pattern cache invalidation for ${namespace}:${pattern} rolled back — cache retains valid data`)
     })
     return 0
   }
@@ -291,7 +319,15 @@ export async function invalidateTenantCache(
     throw new ServiceUnavailableError('Cache backend is unavailable; tenant cache was not invalidated')
   }
 
-  const keysCleared = await cache.clearNamespace(tenantId)
+  let keysCleared: number
+  try {
+    // Tenant support tooling must not turn a backend failure into a false
+    // zero-key success. Other cache callers retain the historical best-effort
+    // behavior of clearNamespace() by leaving throwOnError disabled.
+    keysCleared = await cache.clearNamespace(tenantId, { throwOnError: true })
+  } catch {
+    throw new ServiceUnavailableError('Cache backend is unavailable; tenant cache was not invalidated')
+  }
 
   logger.info({
     message: 'Tenant cache invalidated',

@@ -1,6 +1,7 @@
 import { randomBytes, createHash } from 'crypto'
 import { ApiKeysRepository } from '../db/repositories/apiKeysRepository.js'
 import { pool } from '../db/pool.js'
+import { SingleFlight } from '../lib/singleflight.js'
 
 // ── Scope constants ──────────────────────────────────────────────────────────
 
@@ -70,6 +71,17 @@ const repository = new ApiKeysRepository(pool)
 const inMemoryStore = new Map<string, StoredApiKey>()
 let useInMemory = process.env.NODE_ENV === 'test' && !process.env.TEST_WITH_DB
 
+/**
+ * Per-key singleflight guard for `validateApiKey`.
+ *
+ * Coalesces concurrent validation calls for the same raw key so that only one
+ * hash comparison + store look-up runs at a time.  All concurrent callers with
+ * the same key share a single result.  This prevents thundering-herd stampedes
+ * during burst traffic and closes the check-time / use-time (TOCTOU) window
+ * where a revocation races an in-flight look-up.
+ */
+const validateSingleFlight = new SingleFlight()
+
 function hashKey(rawKey: string): string {
   return createHash('sha256').update(rawKey).digest('hex')
 }
@@ -129,12 +141,26 @@ export function generateApiKey(
 /**
  * Validate a raw API key.
  *
+ * Concurrent calls with the same `rawKey` are coalesced: only one underlying
+ * hash comparison + store look-up executes at a time; all concurrent callers
+ * share the result.  This prevents thundering-herd load on the key store and
+ * closes the TOCTOU window where a concurrent revocation races a validation.
+ *
  * @param rawKey  The key supplied by the caller
  * @returns       The stored key record (with lastUsedAt updated) or null if invalid/revoked
  */
 export async function validateApiKey(rawKey: string): Promise<StoredApiKey | null> {
   if (!/^cr_[0-9a-f]{64}$/.test(rawKey)) return null
 
+  // Coalesce concurrent look-ups for the same key to a single operation.
+  return validateSingleFlight.do(rawKey, () => _validateApiKeyDirect(rawKey))
+}
+
+/**
+ * Inner (non-coalesced) key validation used by the singleflight worker.
+ * Not exported — callers should always go through `validateApiKey`.
+ */
+async function _validateApiKeyDirect(rawKey: string): Promise<StoredApiKey | null> {
   const prefix = extractPrefix(rawKey)
   const hashed = hashKey(rawKey)
 
@@ -150,7 +176,10 @@ export async function validateApiKey(rawKey: string): Promise<StoredApiKey | nul
   } else {
     const apiKey = await repository.findByHashAndPrefix(hashed, prefix)
     if (apiKey) {
-      await repository.updateLastUsedAt(apiKey.id)
+      // The usage record is owner-scoped, so the owner must be carried through
+      // from the resolved key. Omitting it would leave `owner_id = NULL` in the
+      // UPDATE and silently match no rows.
+      await repository.updateLastUsedAt(apiKey.id, apiKey.ownerId)
       apiKey.lastUsedAt = new Date()
     }
     return apiKey
@@ -160,16 +189,25 @@ export async function validateApiKey(rawKey: string): Promise<StoredApiKey | nul
 /**
  * Revoke an API key by ID.
  *
+ * @param id       Opaque key ID to revoke.
+ * @param ownerId  Optional owner to scope the revocation to. Pass it whenever
+ *                 the authenticated owner is known: the store then refuses to
+ *                 touch a key owned by anybody else. Omit it only when the
+ *                 caller has already resolved and authorised the key's owner
+ *                 upstream (admin tooling, the rotation service) — that keeps
+ *                 the legacy id-only behaviour for existing callers.
  * @returns true if the key was found and deactivated, false if not found
+ *          (or not owned by `ownerId`)
  */
-export async function revokeApiKey(id: string): Promise<boolean> {
+export async function revokeApiKey(id: string, ownerId?: string): Promise<boolean> {
   if (useInMemory) {
     const key = inMemoryStore.get(id)
     if (!key) return false
+    if (ownerId !== undefined && key.ownerId !== ownerId) return false
     key.active = false
     return true
   } else {
-    return await repository.revokeApiKey(id)
+    return await repository.revokeApiKey(id, ownerId)
   }
 }
 
