@@ -111,8 +111,7 @@
   "overrides": {
     "@emnapi/core": "1.11.1",
     "@emnapi/runtime": "1.11.1",
-    "@emnapi/wasi-threads": "1.2.2",
-    "@rolldown/binding-linux-x64-gnu": false
+    "@emnapi/wasi-threads": "1.2.2"
   },
   "optionalDependencies": {
     "@rolldown/binding-win32-x64-msvc": "^1.2.0"
