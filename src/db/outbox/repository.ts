@@ -13,6 +13,12 @@ import { sanitizeErrorMessage } from './errorSanitizer.js'
 /** Upper bound on the exponential backoff delay between retry attempts. */
 const MAX_BACKOFF_SECONDS = 3600
 
+/** Hard upper bound on rows returned by a single claim/fetch call. */
+const MAX_CLAIM_LIMIT = 10_000
+
+/** Hard upper bound on lease duration (seconds) to prevent effectively-infinite leases. */
+const MAX_LEASE_SECONDS = 86_400
+
 /**
  * Clamp a caller-supplied limit to a safe positive integer.
  * Prevents unbounded scans and negative/NaN LIMIT values reaching SQL.
@@ -21,7 +27,18 @@ function normalizeLimit(limit: number, fallback: number = 100): number {
   if (!Number.isFinite(limit) || limit <= 0) {
     return fallback
   }
-  return Math.min(Math.floor(limit), 10_000)
+  return Math.min(Math.floor(limit), MAX_CLAIM_LIMIT)
+}
+
+/**
+ * Validate a positive integer bound. Rejects NaN, Infinity, non-integers,
+ * and values outside [min, max] so callers cannot silently pass unsafe
+ * values (e.g. negative limits that would disable LIMIT semantics).
+ */
+function assertBoundedInt(value: number, name: string, min: number, max: number): void {
+  if (!Number.isInteger(value) || value < min || value > max) {
+    throw new RangeError(`${name} must be an integer in [${min}, ${max}], received ${value}`)
+  }
 }
 
 type OutboxEventRow = {
@@ -243,7 +260,7 @@ export class OutboxRepository {
          RETURNING id, aggregate_type, aggregate_id, event_type, payload, status,
                    retry_count, max_retries, created_at, processed_at, error_message,
                    consumer_id, lease_expires_at, trace_id, span_id, tracestate,
-                   shard_count, shard_id, correlation_id, publish_idempotency_key`,
+shard_count, shard_id, correlation_id, publish_idempotency_key`,
         [safeLimit, consumerId, safeLeaseSeconds.toString(), shardCount ?? null, shardId ?? null]
       )
 
@@ -296,7 +313,7 @@ export class OutboxRepository {
          RETURNING id, aggregate_type, aggregate_id, event_type, payload, status,
                    retry_count, max_retries, created_at, processed_at, error_message,
                    consumer_id, lease_expires_at, trace_id, span_id, tracestate,
-                   shard_count, shard_id, correlation_id, publish_idempotency_key`,
+shard_count, shard_id, correlation_id, publish_idempotency_key`,
         [safeLimit, consumerId, safeLeaseSeconds.toString(), shardCount ?? null, shardId ?? null]
       )
 
@@ -421,7 +438,7 @@ export class OutboxRepository {
          )
          RETURNING id, aggregate_type, aggregate_id, event_type, payload, status, 
                    retry_count, max_retries, created_at, processed_at, error_message,
-                   trace_id, span_id, tracestate, correlation_id`,
+trace_id, span_id, tracestate, correlation_id`,
         [safeLimit]
       )
 
@@ -459,7 +476,7 @@ export class OutboxRepository {
          )
          RETURNING id, aggregate_type, aggregate_id, event_type, payload, status, 
                    retry_count, max_retries, created_at, processed_at, error_message,
-                   trace_id, span_id, tracestate, correlation_id`,
+trace_id, span_id, tracestate, correlation_id`,
         [safeLimit]
       )
 
@@ -532,7 +549,7 @@ export class OutboxRepository {
    * Mark an event as failed and increment retry count.
    * If max retries exceeded, status remains 'failed'.
    */
-  async markFailed(db: Queryable, eventId: bigint, errorMessage: string, consumerId: string): Promise<{ status: string; retryCount: number }> {
+async markFailed(db: Queryable, eventId: bigint, errorMessage: string, consumerId: string): Promise<{ status: string; retryCount: number }> {
     // Truncate/redact before persisting: exception messages can incidentally
     // carry secrets (e.g. an Authorization header echoed by an HTTP client
     // error) or be unbounded in length.
